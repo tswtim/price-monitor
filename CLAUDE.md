@@ -1,59 +1,44 @@
-# Price Monitor — Мониторинг цен конкурентов на красную икру
+# Price Monitor — мониторинг цен конкурентов
 
-## Что это за проект
+Сбор цен на красную икру с 3 сайтов, сопоставление с нашими SKU, вывод в XLSX.
 
-Автоматический сбор цен на красную икру с сайтов конкурентов:
-- **apeti.ru** — парсинг HTML (lxml + httpx)
-- **seafood-shop.ru** (Икорный) — прямой JSON API
-- **delikateska.ru** (Деликатеска) — GraphQL API
+## Структура (что где лежит)
 
-Результат: таблица сравнения цен, нормализованных к цене за 100 г, с историей изменений.
+```
+price-monitor/
+├── my_skus.csv          ← ✍️ ПОЛЬЗОВАТЕЛЬ РЕДАКТИРУЕТ: список своих товаров
+├── result.xlsx          ← 📊 РЕЗУЛЬТАТ: открыть после запуска (3 листа)
+├── result_archive/      ← 📁 АРХИВ: прошлые результаты (авто)
+├── colab.ipynb           ← 🚀 Запустить в Google Colab
+├── monitor/             ← ⚙️ КОД: не трогать
+│   ├── cli.py           ← точка входа: --run, --status, --init-skus
+│   ├── tracker.py       ← управление result.xlsx (загрузка/сохранение/сопоставление)
+│   ├── matcher.py       ← извлечение ключевых слов, сопоставление SKU
+│   ├── config.py        ← настройки сайтов и путей
+│   └── adapters/        ← сборщики для apeti.ru, seafood-shop.ru, delikateska.ru
+└── scripts/             ← вспомогательные скрипты
+```
+
+## Формат my_skus.csv
+
+```csv
+name,our_price_rub,weight_g
+Икра горбуши 1/120,1590,120
+Икра горбуши 1/250,2900,250
+```
+
+Ключевые слова извлекаются автоматически из названий.
+
+## Формат result.xlsx
+
+- **Лист «Совпадения»** — каждый найденный продукт × SKU. Колонка `is_comparable` для ручной оценки
+- **Лист «Сводка по SKU»** — мин/средняя/макс цена конкурента по каждому SKU
+- **Лист «Мои SKU»** — список SKU с авто-извлечёнными ключевыми словами
 
 ## Как запустить
 
 ```bash
-# Сбор цен со всех сайтов
-python -m monitor.cli --run
-
-# Показать последний отчёт (без повторного сбора)
-python -m monitor.cli --report
-
-# История изменений цен
-python -m monitor.cli --history
+python -m monitor.cli --init-skus   # Создать шаблон my_skus.csv
+python -m monitor.cli --run         # Сбор + сопоставление + result.xlsx
+python -m monitor.cli --status      # Краткая сводка
 ```
-
-## Структура
-
-```
-monitor/
-├── cli.py              # Точка входа: --run, --report, --history
-├── config.py           # Сайты, товары, цены — здесь менять настройки
-├── normalize.py        # Фильтрация и нормализация цен
-├── store.py            # SQLite-база с историей
-├── report.py           # Таблицы, CSV, JSON
-└── adapters/
-    ├── apeti.py        # apeti.ru
-    ├── seafood_shop.py # seafood-shop.ru
-    └── delikateska.py  # delikateska.ru (GraphQL)
-data/                   # База, отчёты, снапшоты (не в git)
-```
-
-## Настройка под себя
-
-1. **Наша цена**: отредактируй `data/user_price.json` — `{"price_rub": 1590}`
-2. **Товары для отслеживания**: `monitor/config.py` → `DEFAULT_TARGETS`
-3. **Добавить сайт**: создай адаптер в `monitor/adapters/` по образцу существующих
-
-## Перенос на другой компьютер
-
-```bash
-# 1. Скопируй папку price-monitor/
-# 2. Установи зависимости
-pip install -r requirements.txt
-playwright install chromium
-
-# 3. Готово — запускай
-python -m monitor.cli --run
-```
-
-Все `.claude/` команды и скиллы находятся внутри проекта — Claude Code подхватит их автоматически при запуске из этой папки.

@@ -14,8 +14,10 @@ DB_PATH = DATA_DIR / "prices.db"
 
 # Our product: the weight we normalize competitor prices to
 OUR_TARGET_WEIGHT_G: float = 120.0
-SKUS_PATH = DATA_DIR / "skus.csv"
-OUTPUT_XLSX_PATH = DATA_DIR / "products.xlsx"
+# User-facing files — at project ROOT for easy access in Colab
+SKUS_PATH = ROOT / "my_skus.csv"              # EDIT THIS: your product list
+OUTPUT_XLSX_PATH = ROOT / "result.xlsx"        # YOUR RESULT: open after each run
+RESULT_ARCHIVE_DIR = ROOT / "result_archive"   # Auto-saved past results
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,6 @@
 """ProductTracker v3 — multi-SKU matching with XLSX output.
 
-Manages the persistent product table (data/products.xlsx).
+Manages the persistent product table (data/result.xlsx).
 Matches scraped products against user's SKU catalog by auto-extracted keywords.
 """
 
@@ -13,7 +13,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-from .config import DATA_DIR, OUTPUT_XLSX_PATH
+from .config import OUTPUT_XLSX_PATH, RESULT_ARCHIVE_DIR
 from .matcher import match_products_to_skus, extract_keywords
 from .normalize import is_red_caviar
 
@@ -46,7 +46,7 @@ class ProductTracker:
     # Load existing XLSX
     # ------------------------------------------------------------------
     def load(self) -> bool:
-        """Load existing products.xlsx. Returns True if file existed."""
+        """Load existing result.xlsx. Returns True if file existed."""
         if not OUTPUT_XLSX_PATH.exists():
             return False
 
@@ -133,12 +133,13 @@ class ProductTracker:
     # Save XLSX
     # ------------------------------------------------------------------
     def save(self) -> Path:
-        """Save to products.xlsx with 3 sheets. Returns path."""
+        """Save to result.xlsx with 3 sheets. Returns path."""
         self.finalize()
 
-        # Backup existing
+        # Backup existing to archive
         if OUTPUT_XLSX_PATH.exists():
-            backup = DATA_DIR / f"products_{self.today}.xlsx"
+            RESULT_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            backup = RESULT_ARCHIVE_DIR / f"result_{self.today}.xlsx"
             shutil.copy2(OUTPUT_XLSX_PATH, backup)
 
         wb = Workbook()
@@ -340,9 +341,9 @@ def run_tracker(scraped_all: list[dict], skus: list[dict]) -> ProductTracker:
     # Load existing table
     existed = tracker.load()
     if existed:
-        print(f"📂 Загружено {len(tracker.matches)} совпадений из products.xlsx\n")
+        print(f"📂 Загружено {len(tracker.matches)} совпадений из result.xlsx\n")
     else:
-        print("📂 products.xlsx не найден — будет создан новый файл\n")
+        print("📂 result.xlsx не найден — будет создан новый файл\n")
 
     # --- Merge ---
     print(f"🔄 Сопоставление: {len(scraped_all)} продуктов × {len(skus)} SKU...")
