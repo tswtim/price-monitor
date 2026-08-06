@@ -5,7 +5,6 @@ Matches scraped products against SKUs by keyword presence.
 """
 
 import re
-import csv
 from pathlib import Path
 from typing import Optional
 
@@ -84,9 +83,9 @@ def extract_keywords(name: str) -> list[str]:
 # SKU loading and matching
 # ---------------------------------------------------------------------------
 def load_skus(path: Optional[Path] = None) -> list[dict]:
-    """Load SKU definitions from CSV.
+    """Load SKU definitions from XLSX.
 
-    CSV columns: name, our_price_rub, weight_g
+    XLSX columns: name, our_price_rub, weight_g
 
     Returns list of dicts with added 'keywords' field.
     """
@@ -94,37 +93,71 @@ def load_skus(path: Optional[Path] = None) -> list[dict]:
     if not path.exists():
         return []
 
-    with open(path, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        skus = []
-        for row in reader:
-            name = row.get("name", "").strip()
-            if not name:
-                continue
-            sku = {
-                "name": name,
-                "our_price_rub": float(row.get("our_price_rub", 0) or 0),
-                "weight_g": float(row.get("weight_g", 0) or 0),
-                "keywords": extract_keywords(name),
-            }
-            skus.append(sku)
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    ws = wb.active
+
+    # Read headers from row 1
+    headers = [cell.value for cell in ws[1]]
+    name_col = headers.index("name") if "name" in headers else 0
+    price_col = headers.index("our_price_rub") if "our_price_rub" in headers else 1
+    weight_col = headers.index("weight_g") if "weight_g" in headers else 2
+
+    skus = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        name = str(row[name_col] or "").strip() if name_col < len(row) else ""
+        if not name:
+            continue
+        price = float(row[price_col] or 0) if price_col < len(row) else 0.0
+        weight = float(row[weight_col] or 0) if weight_col < len(row) else 0.0
+        skus.append({
+            "name": name,
+            "our_price_rub": price,
+            "weight_g": weight,
+            "keywords": extract_keywords(name),
+        })
     return skus
 
 
 def create_skus_template(path: Optional[Path] = None) -> Path:
-    """Create a template skus.csv with examples if it doesn't exist."""
+    """Create a template my_skus.xlsx with examples if it doesn't exist."""
     path = path or SKUS_PATH
     if path.exists():
         return path
 
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Мои SKU"
+
+    # Header
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    for col, h in enumerate(["name", "our_price_rub", "weight_g"], 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+
+    # Examples
+    examples = [
+        ["Икра горбуши (1/120)", 1590, 120],
+        ["Икра горбуши (1/250)", 2900, 250],
+        ["Икра кеты 1/140", 2100, 140],
+        ["Икра нерки 500г", 1800, 100],
+    ]
+    for r, row_data in enumerate(examples, 2):
+        for c, val in enumerate(row_data, 1):
+            ws.cell(row=r, column=c, value=val)
+
+    ws.column_dimensions["A"].width = 35
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 10
+    ws.freeze_panes = "A2"
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["name", "our_price_rub", "weight_g"])
-        writer.writerow(["Икра горбуши 1/120", "1590", "120"])
-        writer.writerow(["Икра горбуши 1/250", "2900", "250"])
-        writer.writerow(["Икра кеты 1/140", "2100", "140"])
-        writer.writerow(["Икра нерки 1/100", "1800", "100"])
+    wb.save(str(path))
     return path
 
 

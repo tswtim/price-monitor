@@ -78,7 +78,7 @@ def cmd_run(quiet: bool = False) -> None:
     """Full run: scrape → match → save XLSX."""
     # ---- Load SKUs ----
     if not SKUS_PATH.exists():
-        print("📝 Файл my_skus.csv не найден. Создаю шаблон...")
+        print("📝 Файл my_skus.xlsx не найден. Создаю шаблон...")
         create_skus_template()
         print(f"   ✅ Шаблон создан: {SKUS_PATH}")
         print(f"   📋 Заполни его своими SKU (название, наша цена, вес)")
@@ -87,7 +87,7 @@ def cmd_run(quiet: bool = False) -> None:
 
     skus = load_skus()
     if not skus:
-        print("❌ my_skus.csv пуст или не содержит SKU.")
+        print("❌ my_skus.xlsx пуст или не содержит SKU.")
         return
 
     print(f"📋 Загружено {len(skus)} SKU из {SKUS_PATH}")
@@ -127,7 +127,7 @@ def cmd_status() -> None:
     """Quick status from existing XLSX."""
     skus = load_skus()
     if not skus:
-        print("❌ my_skus.csv не найден.")
+        print("❌ my_skus.xlsx не найден.")
         print("   Запустите python -m monitor.cli --run для создания шаблона.")
         return
 
@@ -151,7 +151,7 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true",
                         help="Тихий режим (только запись XLSX)")
     parser.add_argument("--init-skus", action="store_true",
-                        help="Создать шаблон my_skus.csv")
+                        help="Создать шаблон my_skus.xlsx")
 
     args = parser.parse_args()
 
@@ -170,7 +170,7 @@ def main() -> None:
             parser.print_help()
             print(f"\n💡 Первый запуск:")
             print(f"   1. python -m monitor.cli --init-skus  (создать шаблон SKU)")
-            print(f"   2. Заполни my_skus.csv своими товарами")
+            print(f"   2. Заполни my_skus.xlsx своими товарами")
             print(f"   3. python -m monitor.cli --run        (запустить анализ)")
 
 
