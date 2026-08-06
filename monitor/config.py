@@ -12,6 +12,9 @@ REPORTS_DIR = DATA_DIR / "reports"
 USER_PRICE_FILE = DATA_DIR / "user_price.json"
 DB_PATH = DATA_DIR / "prices.db"
 
+# Our product: the weight we normalize competitor prices to
+OUR_TARGET_WEIGHT_G: float = 120.0
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Competitor price monitoring — CLI entry point.
+"""Competitor price monitoring v2 — CLI entry point.
 
 Usage:
-    python -m monitor.cli --run          # Full scrape + report
-    python -m monitor.cli --report       # Show last saved report
-    python -m monitor.cli --history      # Show price trends
-    python -m monitor.cli --selftest     # Run offline with saved fixtures
+    python -m monitor.cli --run          # Full scrape + update products.csv
+    python -m monitor.cli --report       # Show report from products.csv
     python -m monitor.cli --quiet        # Scrape only, no output (for scheduler)
 """
 
@@ -13,27 +11,24 @@ import sys
 import argparse
 import json
 import datetime
-from pathlib import Path
-from typing import Optional
 
 # Fix Windows encoding for emoji/unicode output
-if sys.platform == 'win32':
+if sys.platform == "win32":
     try:
-        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
 from .config import (
     DEFAULT_SITES,
     DEFAULT_TARGETS,
-    SNAPSHOTS_DIR,
+    USER_PRICE_FILE,
+    OUR_TARGET_WEIGHT_G,
     ProductTarget,
     SiteConfig,
     load_user_price,
 )
-from .normalize import normalize_batch
-from .store import start_run, finish_run, save_prices, get_last_run_prices, get_price_trends
-from .report import terminal_report, save_csv, save_json
+from .tracker import run_tracker, print_tracker_report, ProductTracker
 from .adapters.apeti import ApetiAdapter
 from .adapters.seafood_shop import SeafoodShopAdapter
 from .adapters.delikateska import DelikateskaAdapter
@@ -47,10 +42,12 @@ ADAPTERS = {
 }
 
 
-def run_scrape(sites: list[SiteConfig], target: ProductTarget,
-               quiet: bool = False) -> list[dict]:
-    """Scrape all sites and return normalized products."""
-    all_products = []
+# ---------------------------------------------------------------------------
+# Collect raw products from all sites
+# ---------------------------------------------------------------------------
+def collect_all_sites(sites: list[SiteConfig], quiet: bool = False) -> list[dict]:
+    """Scrape all configured sites, return list of raw product dicts."""
+    all_raw: list[dict] = []
 
     for site_config in sites:
         adapter_cls = ADAPTERS.get(site_config.name)
@@ -62,189 +59,135 @@ def run_scrape(sites: list[SiteConfig], target: ProductTarget,
         if not quiet:
             print(f"\n🔍 {site_config.display_name} ({site_config.name})...")
 
-        # Start run record
-        run_id = start_run(site_config.name)
-
         try:
             adapter = adapter_cls(site_config)
             raw_products = adapter.fetch()
 
             if not quiet:
-                print(f"   Найдено: {len(raw_products)} товаров (до фильтрации)")
+                print(f"   Собрано: {len(raw_products)} товаров")
 
-            # Save raw snapshot
-            snapshot_path = _save_snapshot(site_config.name, raw_products)
-
-            # Normalize with deduplication
-            target_dict = {
-                "name": target.name,
-                "weight_g": target.weight_g,
-                "keywords": target.keywords,
-            }
-
-            # Deduplicate by product_id before normalizing
+            # Deduplicate by product_id
             seen_ids = set()
-            unique_raw = []
             for p in raw_products:
                 pid = p.product_id
                 if pid and pid in seen_ids:
                     continue
                 if pid:
                     seen_ids.add(pid)
-                unique_raw.append(p)
-
-            normalized = normalize_batch([p.to_dict() for p in unique_raw], target_dict)
-
-            if not quiet:
-                print(f"   После фильтрации: {len(normalized)} товаров (красная икра)")
-                exact = sum(1 for p in normalized if p.get("match_tier") == "exact")
-                close = sum(1 for p in normalized if p.get("match_tier") == "close")
-                print(f"   Совпадений: exact={exact}, close={close}")
-
-            # Save to DB
-            save_prices(run_id, normalized)
-            finish_run(run_id, products_found=len(normalized),
-                       snapshot_path=str(snapshot_path) if snapshot_path else None)
-
-            all_products.extend(normalized)
+                all_raw.append(p.to_dict())
 
         except Exception as e:
             if not quiet:
-                print(f"   ❌ Ошибка: {e}")
-            finish_run(run_id, error=str(e))
+                print(f"   [!] Ошибка: {e}")
 
-    return all_products
-
-
-def _save_snapshot(site_name: str, products) -> Optional[Path]:
-    """Save raw products as a JSON snapshot."""
-    try:
-        now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        path = SNAPSHOTS_DIR / f"{site_name}_{now}.json"
-        data = {
-            "site": site_name,
-            "collected_at": datetime.datetime.now().isoformat(),
-            "count": len(products),
-            "products": [p.to_dict() if hasattr(p, 'to_dict') else p for p in products],
-        }
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        return path
-    except Exception:
-        return None
+    return all_raw
 
 
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 def cmd_run(quiet: bool = False) -> None:
-    """Run the full scrape pipeline."""
+    """Full run: scrape → tracker → report."""
     target = DEFAULT_TARGETS[0]
 
-    # Override with user's price if set
-    user_price = load_user_price()
-    if user_price:
-        target.our_price_rub = user_price
+    # User price
+    our_price = load_user_price() or target.our_price_rub
+    target_weight = target.weight_g or OUR_TARGET_WEIGHT_G
 
-    products = run_scrape(DEFAULT_SITES, target, quiet=quiet)
+    # --- Scrape ---
+    if not quiet:
+        print("=" * 60)
+        print("СБОР ДАННЫХ")
+        print("=" * 60)
 
-    if not products:
-        if not quiet:
-            print("\n❌ Не удалось собрать данные ни с одного сайта.")
+    scraped = collect_all_sites(DEFAULT_SITES, quiet=quiet)
+
+    if not scraped:
+        print("\n❌ Не удалось собрать данные ни с одного сайта.")
         return
 
-    # Sort by price_per_100g
-    products.sort(key=lambda p: p.get("price_per_100g") or float("inf"))
-
-    # Report
     if not quiet:
-        previous = get_last_run_prices()
-        report = terminal_report(products, target, previous)
-        print(report)
+        print(f"\n📦 Всего собрано (до фильтрации): {len(scraped)} товаров")
 
-    # Save CSV and JSON
-    csv_path = save_csv(products)
-    json_path = save_json(products)
-
+    # --- Tracker ---
     if not quiet:
-        print(f"\n📁 Отчёт сохранён:")
-        print(f"   CSV: {csv_path}")
-        print(f"   JSON: {json_path}")
+        print(f"\n{'=' * 60}")
+        print("ОБРАБОТКА")
+        print("=" * 60)
+
+    tracker = run_tracker(scraped, target_weight_g=target_weight)
+
+    # --- Report ---
+    if not quiet:
+        print(f"\n{'=' * 60}")
+        print("ОТЧЁТ")
+        print("=" * 60)
+        print_tracker_report(tracker, our_price=our_price)
+
+    # Summary
+    summary = tracker.get_summary()
+    new_count = summary.get("new_unevaluated", 0)
+    if new_count > 0:
+        print(f"\n📝 Открой data/products.csv и поставь 'да' или 'нет'")
+        print(f"   в колонке is_comparable для {new_count} новых продуктов.")
 
 
 def cmd_report() -> None:
-    """Show the most recent report."""
-    products = get_last_run_prices()
-    if not products:
-        print("❌ Нет сохранённых данных. Запустите --run сначала.")
+    """Show report from existing products.csv."""
+    tracker = ProductTracker(target_weight_g=OUR_TARGET_WEIGHT_G)
+
+    if not tracker.load():
+        print("❌ data/products.csv не найден.")
+        print("   Запустите: python -m monitor.cli --run")
         return
 
     target = DEFAULT_TARGETS[0]
-    user_price = load_user_price()
-    if user_price:
-        target.our_price_rub = user_price
+    our_price = load_user_price() or target.our_price_rub
 
-    print(terminal_report(products, target))
+    print_tracker_report(tracker, our_price=our_price)
+
+    new_count = tracker.get_summary().get("new_unevaluated", 0)
+    if new_count > 0:
+        print(f"\n📝 {new_count} новых продуктов ждут оценки в data/products.csv")
 
 
-def cmd_history() -> None:
-    """Show price trend history."""
-    products = get_last_run_prices()
-    if not products:
-        print("❌ Нет сохранённых данных.")
+def cmd_status() -> None:
+    """Quick status: just show summary counts."""
+    tracker = ProductTracker()
+    if not tracker.load():
+        print("Нет данных. Запустите: python -m monitor.cli --run")
         return
 
-    # Get unique product keys
-    keys = list(set(p.get("product_key", "") for p in products if p.get("product_key")))
-    trends = get_price_trends(keys[:20], limit=5)  # Show top 20 products
+    s = tracker.get_summary()
+    print(f"Всего продуктов: {s['total']}")
+    print(f"  Сопоставимых:   {s['comparable']} (в наличии: {s['comparable_in_stock']})")
+    print(f"  Несопоставимых: {s['non_comparable']}")
+    print(f"  Новых:          {s['new_unevaluated']}")
 
-    print("\n📊 История цен\n")
-
-    for key, entries in trends.items():
-        if len(entries) < 2:
-            continue
-        latest = entries[0]
-        name = latest.get("name", key)[:50]
-        site = latest.get("site", "")
-        prices = [e.get("price_rub", 0) for e in entries]
-        dates = [e.get("collected_at", "")[:10] for e in entries]
-
-        trend_str = " → ".join(f"{p:,.0f} ₽".replace(",", " ") for p in reversed(prices))
-        print(f"  {site}: {name}")
-        print(f"     {trend_str}")
-        print()
+    if s['comparable_in_stock'] > 0:
+        print(f"\nЦены за {OUR_TARGET_WEIGHT_G:.0f} г:")
+        print(f"  Мин: {s['min_price']:,.0f} ₽".replace(',', ' '))
+        print(f"  Ср:  {s['avg_price']:,.0f} ₽".replace(',', ' '))
+        print(f"  Макс:{s['max_price']:,.0f} ₽".replace(',', ' '))
 
 
-def cmd_selftest() -> None:
-    """Run adapters against saved fixtures."""
-    fixtures_dir = Path(__file__).resolve().parent.parent / "tests" / "fixtures"
-    if not fixtures_dir.exists() or not list(fixtures_dir.glob("*.json")):
-        print("⚠ Нет сохранённых фикстур. Сначала сделайте --run для создания снапшотов.")
-        print("  Фикстуры можно создать из снапшотов в data/snapshots/")
-        return
-
-    print(f"🧪 Запуск тестов на фикстурах из {fixtures_dir}\n")
-
-    for fixture_path in sorted(fixtures_dir.glob("*.json")):
-        try:
-            data = json.loads(fixture_path.read_text(encoding="utf-8"))
-            site = data.get("site", fixture_path.stem)
-            products_count = len(data.get("products", []))
-            print(f"  ✅ {site}: {products_count} товаров в фикстуре")
-        except Exception as e:
-            print(f"  ❌ {fixture_path.name}: ошибка — {e}")
-
-
-def main():
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Мониторинг цен конкурентов на красную икру",
+        description="Мониторинг цен конкурентов v2 — накопительная таблица продуктов",
     )
     parser.add_argument("--run", action="store_true",
-                        help="Запустить сбор цен со всех сайтов")
+                        help="Собрать цены и обновить products.csv")
     parser.add_argument("--report", action="store_true",
-                        help="Показать последний сохранённый отчёт")
-    parser.add_argument("--history", action="store_true",
-                        help="Показать историю изменения цен")
-    parser.add_argument("--selftest", action="store_true",
-                        help="Запустить тесты на сохранённых фикстурах")
+                        help="Показать отчёт из products.csv")
+    parser.add_argument("--status", action="store_true",
+                        help="Краткая сводка")
     parser.add_argument("--quiet", action="store_true",
-                        help="Тихий режим (только запись в БД, без вывода)")
+                        help="Тихий режим (только запись CSV)")
+    parser.add_argument("--target-weight", type=float, default=OUR_TARGET_WEIGHT_G,
+                        help=f"Вес нашего продукта для сопоставления (по умолчанию: {OUR_TARGET_WEIGHT_G:.0f} г)")
 
     args = parser.parse_args()
 
@@ -252,18 +195,17 @@ def main():
         cmd_run(quiet=args.quiet)
     elif args.report:
         cmd_report()
-    elif args.history:
-        cmd_history()
-    elif args.selftest:
-        cmd_selftest()
+    elif args.status:
+        cmd_status()
     else:
-        # Default: show report if data exists, else suggest --run
-        products = get_last_run_prices()
-        if products:
-            cmd_report()
+        # Default: show status if data exists
+        tracker = ProductTracker()
+        if tracker.load():
+            cmd_status()
+            print("\nПолный отчёт: python -m monitor.cli --report")
         else:
             parser.print_help()
-            print("\n💡 Нет сохранённых данных. Запустите: python -m monitor.cli --run")
+            print("\n💡 Запустите: python -m monitor.cli --run")
 
 
 if __name__ == "__main__":
