@@ -14,6 +14,8 @@ DB_PATH = DATA_DIR / "prices.db"
 
 # Our product: the weight we normalize competitor prices to
 OUR_TARGET_WEIGHT_G: float = 120.0
+SKUS_PATH = DATA_DIR / "skus.csv"
+OUTPUT_XLSX_PATH = DATA_DIR / "products.xlsx"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)

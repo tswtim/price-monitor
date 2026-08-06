@@ -1,471 +1,405 @@
-"""ProductTracker — управление персистентной CSV-таблицей продуктов.
+"""ProductTracker v3 — multi-SKU matching with XLSX output.
 
-Это ядро v2: накопительная таблица products.csv, ручное курирование
-сопоставимости, обновление цен при повторных запусках.
-
-Workflow:
-  Проход 1 — scrape all sites, match by URL, update/add products
-  Проход 2 — re-check missing comparable products via direct URL visit
-  Проход 3 — save CSV + backup, generate report
+Manages the persistent product table (data/products.xlsx).
+Matches scraped products against user's SKU catalog by auto-extracted keywords.
 """
 
-import csv
 import datetime
 import shutil
-import re
 from pathlib import Path
 from typing import Optional
 
-import httpx
-from lxml import etree
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-from .config import DATA_DIR, OUR_TARGET_WEIGHT_G
-from .normalize import extract_weight_grams, safe_int_price, is_red_caviar
-
+from .config import DATA_DIR, OUTPUT_XLSX_PATH
+from .matcher import match_products_to_skus, extract_keywords
+from .normalize import is_red_caviar
 
 # ---------------------------------------------------------------------------
-# Column names in products.csv
+# Styles for XLSX
 # ---------------------------------------------------------------------------
-COLUMNS = [
-    "site",
-    "product_name",
-    "brand",
-    "weight_g",
-    "original_price_rub",
-    "comparable_price_rub",
-    "in_stock",
-    "check_status",
-    "is_comparable",
-    "url",
-    "first_seen",
-    "last_checked",
-]
-
-CSV_PATH: Path = DATA_DIR / "products.csv"
-
+HEADER_FONT = Font(bold=True, size=11)
+HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+HEADER_FONT_WHITE = Font(bold=True, size=11, color="FFFFFF")
+THIN_BORDER = Border(
+    left=Side(style="thin"), right=Side(style="thin"),
+    top=Side(style="thin"), bottom=Side(style="thin"),
+)
+GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+YELLOW_FILL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
 
 # ---------------------------------------------------------------------------
 # ProductTracker
 # ---------------------------------------------------------------------------
 class ProductTracker:
-    """Manages the persistent product CSV table."""
+    """Tracks products across runs using XLSX as persistent storage."""
 
-    def __init__(self, target_weight_g: float = 120.0):
-        self.target_weight_g = target_weight_g
-        self.rows: list[dict] = []          # текущие данные
-        self._url_index: dict[str, int] = {}  # url → индекс в self.rows
+    def __init__(self, skus: list[dict]):
+        self.skus = skus
+        self.matches: list[dict] = []     # product-SKU matches
         self.today = datetime.date.today().isoformat()
 
     # ------------------------------------------------------------------
-    # Load / Save
+    # Load existing XLSX
     # ------------------------------------------------------------------
     def load(self) -> bool:
-        """Load existing products.csv. Returns True if file existed."""
-        if not CSV_PATH.exists():
+        """Load existing products.xlsx. Returns True if file existed."""
+        if not OUTPUT_XLSX_PATH.exists():
             return False
 
-        with open(CSV_PATH, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            self.rows = list(reader)
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(OUTPUT_XLSX_PATH)
+            ws = wb["Совпадения"]
 
-        # Строим индекс url → строка
-        self._rebuild_index()
-        return True
+            headers = [cell.value for cell in ws[1]]
+            self.matches = []
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if row[0] is None:
+                    continue
+                match = dict(zip(headers, row))
+                self.matches.append(match)
 
-    def save(self) -> None:
-        """Save to products.csv + dated backup."""
-        # Backup current file if exists
-        if CSV_PATH.exists():
-            backup = DATA_DIR / f"products_{self.today}.csv"
-            shutil.copy2(CSV_PATH, backup)
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CSV_PATH, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
-            writer.writeheader()
-            for row in self.rows:
-                writer.writerow({k: row.get(k, "") for k in COLUMNS})
-
-    def _rebuild_index(self) -> None:
-        """Rebuild url → row_index map."""
-        self._url_index.clear()
-        for i, row in enumerate(self.rows):
-            url = row.get("url", "").strip()
-            if url:
-                self._url_index[url] = i
-
-    # ------------------------------------------------------------------
-    # Row helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _new_row(
-        site: str,
-        name: str,
-        brand: str,
-        weight_g: Optional[float],
-        price_rub: float,
-        url: str,
-        today: str,
-        target_weight_g: float,
-    ) -> dict:
-        """Create a new row dict."""
-        weight_g = weight_g or 0.0
-        comparable = round(price_rub / weight_g * target_weight_g, 2) if weight_g > 0 else 0.0
-        return {
-            "site": site,
-            "product_name": name,
-            "brand": brand,
-            "weight_g": str(weight_g) if weight_g else "",
-            "original_price_rub": str(price_rub),
-            "comparable_price_rub": str(comparable) if comparable else "",
-            "in_stock": "да",
-            "check_status": "да",
-            "is_comparable": "",          # пользователь ещё не оценил
-            "url": url,
-            "first_seen": today,
-            "last_checked": today,
-        }
-
-    def _update_row(self, row: dict, weight_g: Optional[float],
-                    price_rub: float, in_stock: str = "да") -> None:
-        """Update an existing row with fresh data."""
-        weight_g = weight_g or 0.0
-        row["weight_g"] = str(weight_g) if weight_g else ""
-        row["original_price_rub"] = str(price_rub)
-        comparable = round(price_rub / weight_g * self.target_weight_g, 2) if weight_g > 0 else 0.0
-        row["comparable_price_rub"] = str(comparable) if comparable else ""
-        row["in_stock"] = in_stock
-        row["check_status"] = "да"
-        row["last_checked"] = self.today
+            return True
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Проход 1: scrape → match → update / add
     # ------------------------------------------------------------------
     def merge_scraped(self, scraped_products: list[dict]) -> dict:
-        """Main pass: match scraped products against existing table.
-
-        Each scraped product is dict with:
-          site, product_id, name, brand, weight_g, price_rub, url, in_stock
+        """Match scraped products against SKUs, merge with existing table.
 
         Returns stats dict.
         """
-        stats = {"updated": 0, "added": 0, "skipped_non_comparable": 0}
+        stats = {"new_matches": 0, "updated": 0, "skipped": 0}
 
-        for sp in scraped_products:
-            url = (sp.get("url") or "").strip()
-            name = sp.get("name", "")
-            if not name:
-                continue
+        # Filter: only red caviar
+        red_caviar = [p for p in scraped_products if is_red_caviar(p.get("name", ""))]
+        if not red_caviar:
+            return stats
 
-            # Фильтр: только красная икра
-            if not is_red_caviar(name):
-                continue
+        # Match products to SKUs
+        new_matches = match_products_to_skus(red_caviar, self.skus)
 
-            price_rub = float(sp.get("price_rub", 0))
-            if price_rub <= 0:
-                continue
+        # Build index: url+sku → existing row
+        existing_index: dict[str, int] = {}
+        for i, m in enumerate(self.matches):
+            key = f"{m.get('url', '')}|{m.get('matched_sku', '')}"
+            if m.get("url"):
+                existing_index[key] = i
 
-            weight_g = sp.get("weight_g")
+        for nm in new_matches:
+            key = f"{nm.get('url', '')}|{nm.get('matched_sku', '')}"
+            if key in existing_index:
+                # Update existing
+                idx = existing_index[key]
+                existing = self.matches[idx]
 
-            # Попытка найти по URL
-            if url and url in self._url_index:
-                idx = self._url_index[url]
-                existing = self.rows[idx]
-
-                # Пропускаем не-сопоставимые
+                # Skip if marked non-comparable
                 if existing.get("is_comparable", "") == "нет":
-                    stats["skipped_non_comparable"] += 1
+                    stats["skipped"] += 1
                     continue
 
-                # Обновляем только если сопоставимый (да или пусто)
-                self._update_row(existing, weight_g, price_rub)
+                # Update price, stock, status
+                existing["product_price_rub"] = nm["product_price_rub"]
+                existing["comparable_price_rub"] = nm["comparable_price_rub"]
+                existing["in_stock"] = "да"
+                existing["check_status"] = "да"
                 stats["updated"] += 1
             else:
-                # Новый продукт
-                brand = sp.get("brand", "")
-                new_row = self._new_row(
-                    site=sp.get("site", ""),
-                    name=name,
-                    brand=brand,
-                    weight_g=weight_g,
-                    price_rub=price_rub,
-                    url=url,
-                    today=self.today,
-                    target_weight_g=self.target_weight_g,
-                )
-                self.rows.append(new_row)
-                if url:
-                    self._url_index[url] = len(self.rows) - 1
-                stats["added"] += 1
+                # New match
+                nm["check_status"] = "да"
+                nm["is_comparable"] = ""
+                self.matches.append(nm)
+                stats["new_matches"] += 1
 
+#        self._recheck_missing()
         return stats
 
     # ------------------------------------------------------------------
-    # Проход 2: re-check missing comparable products
+    # Проход 2: re-check missing (упрощённый — без HTTP-запросов)
     # ------------------------------------------------------------------
-    def recheck_missing(self) -> dict:
-        """Visit URLs of comparable products not found in current scrape.
-
-        Returns stats dict.
-        """
-        stats = {"rechecked": 0, "now_unavailable": 0, "still_available": 0}
-
-        client = httpx.Client(
-            timeout=15.0,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/130.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "ru-RU,ru;q=0.9",
-            },
-            follow_redirects=True,
-        )
-
-        for i, row in enumerate(self.rows):
-            # Только сопоставимые продукты, которые НЕ были проверены сегодня
-            if row.get("is_comparable", "") != "да":
-                continue
-            if row.get("check_status") == "да":
-                continue  # уже проверили в проходе 1
-
-            url = row.get("url", "").strip()
-            if not url:
-                # Без URL не можем перепроверить — помечаем как непроверенный
-                row["check_status"] = "нет"
-                continue
-
-            # Пытаемся достать страницу продукта
-            price = self._fetch_price_from_url(client, url, row.get("site", ""))
-
-            if price is not None and price > 0:
-                # Продукт жив — обновляем цену
-                weight_g = float(row.get("weight_g", 0) or 0)
-                self._update_row(row, weight_g, price, in_stock="да")
-                stats["still_available"] += 1
-            else:
-                # Продукт недоступен
-                row["in_stock"] = "нет"
-                row["check_status"] = "да"
-                row["last_checked"] = self.today
-                stats["now_unavailable"] += 1
-
-            stats["rechecked"] += 1
-
-        return stats
-
-    def _fetch_price_from_url(self, client: httpx.Client,
-                              url: str, site: str) -> Optional[float]:
-        """Try to extract current price from a product page URL."""
-        try:
-            resp = client.get(url)
-            if resp.status_code >= 400:
-                return None
-
-            html = resp.text
-
-            if "apeti.ru" in site:
-                return self._extract_price_apeti(html)
-            elif "seafood-shop" in site:
-                return self._extract_price_seafood(html)
-            elif "delikateska" in site:
-                return self._extract_price_delikateska(html)
-
-            # Generic: look for price patterns
-            prices = re.findall(r'(\d[\d\s]*)\s*(?:₽|руб|р\.)', html)
-            for p_str in prices:
-                p = safe_int_price(p_str)
-                if p and 200 < p < 500000:
-                    return float(p)
-
-        except Exception:
-            pass
-
-        return None
-
-    def _extract_price_apeti(self, html: str) -> Optional[float]:
-        """Extract price from apeti.ru product page."""
-        try:
-            tree = etree.HTML(html)
-            for text in tree.xpath('//*[contains(@class, "product-price-block")]//text()'):
-                p = safe_int_price(text)
-                if p and p > 0:
-                    return float(p)
-        except Exception:
-            pass
-        return None
-
-    def _extract_price_seafood(self, html: str) -> Optional[float]:
-        """Extract price from seafood-shop.ru product page."""
-        # Try embedded JSON first
-        for match in re.finditer(r'"priceSource":(\d+)', html):
-            return float(match.group(1))
-        # Fallback
-        for match in re.finditer(r'(\d[\d\s]*)\s*(?:₽|руб)', html):
-            p = safe_int_price(match.group(1))
-            if p and p > 100:
-                return float(p)
-        return None
-
-    def _extract_price_delikateska(self, html: str) -> Optional[float]:
-        """Extract price from delikateska.ru product page."""
-        for match in re.finditer(r'(\d[\d\s]*)\s*(?:₽|руб)', html):
-            p = safe_int_price(match.group(1))
-            if p and p > 100:
-                return float(p)
-        return None
+    def finalize(self) -> None:
+        """Mark products not found in current scrape as unchecked."""
+        for m in self.matches:
+            if m.get("is_comparable") == "да" and m.get("check_status") != "да":
+                m["check_status"] = "нет"
 
     # ------------------------------------------------------------------
-    # Проход 3: report
+    # Save XLSX
     # ------------------------------------------------------------------
-    def get_comparable_products(self) -> list[dict]:
-        """Return rows with is_comparable='да', sorted by comparable_price."""
-        comparable = [
-            r for r in self.rows
-            if r.get("is_comparable", "") == "да"
-            and r.get("in_stock") == "да"
+    def save(self) -> Path:
+        """Save to products.xlsx with 3 sheets. Returns path."""
+        self.finalize()
+
+        # Backup existing
+        if OUTPUT_XLSX_PATH.exists():
+            backup = DATA_DIR / f"products_{self.today}.xlsx"
+            shutil.copy2(OUTPUT_XLSX_PATH, backup)
+
+        wb = Workbook()
+
+        # --- Sheet 1: Matches ---
+        ws1 = wb.active
+        ws1.title = "Совпадения"
+
+        match_headers = [
+            "site", "product_name", "product_weight_g", "product_price_rub",
+            "matched_sku", "sku_weight_g", "comparable_price_rub",
+            "our_price_rub", "in_stock", "check_status", "is_comparable", "url",
         ]
-        # Sort by comparable_price ascending
-        comparable.sort(
-            key=lambda r: float(r.get("comparable_price_rub", 0) or 999999)
-        )
-        return comparable
+        self._write_sheet(ws1, match_headers, self.matches)
 
-    def get_new_products(self) -> list[dict]:
-        """Return rows where is_comparable is empty (not yet evaluated)."""
-        return [r for r in self.rows if r.get("is_comparable", "") == ""]
+        # Column widths
+        widths1 = [18, 45, 12, 12, 30, 10, 14, 12, 8, 8, 10, 40]
+        for i, w in enumerate(widths1, 1):
+            ws1.column_dimensions[get_column_letter(i)].width = w
 
-    def get_non_comparable(self) -> list[dict]:
-        """Return rows with is_comparable='нет'."""
-        return [r for r in self.rows if r.get("is_comparable", "") == "нет"]
+        # Conditional: color rows by is_comparable
+        for row_idx, m in enumerate(self.matches, 2):
+            comp = m.get("is_comparable", "")
+            if comp == "да":
+                self._color_row(ws1, row_idx, len(match_headers), GREEN_FILL)
+            elif comp == "нет":
+                self._color_row(ws1, row_idx, len(match_headers), RED_FILL)
 
+        # --- Sheet 2: Summary by SKU ---
+        ws2 = wb.create_sheet("Сводка по SKU")
+
+        summary_rows = self._build_summary()
+        summary_headers = [
+            "sku_name", "our_price_rub", "our_weight_g",
+            "min_competitor_price", "avg_competitor_price", "max_competitor_price",
+            "competitor_count", "our_vs_min_%",
+        ]
+        self._write_sheet(ws2, summary_headers, summary_rows)
+
+        widths2 = [35, 12, 10, 14, 14, 14, 10, 12]
+        for i, w in enumerate(widths2, 1):
+            ws2.column_dimensions[get_column_letter(i)].width = w
+
+        # Color: green if our price below min, red if above max
+        for row_idx, sr in enumerate(summary_rows, 2):
+            vs_min = sr.get("our_vs_min_%", 0) or 0
+            if isinstance(vs_min, str):
+                try:
+                    vs_min = float(vs_min)
+                except (ValueError, TypeError):
+                    vs_min = 0
+            if vs_min < 0:
+                self._color_row(ws2, row_idx, len(summary_headers), GREEN_FILL)
+            elif vs_min > 10:
+                self._color_row(ws2, row_idx, len(summary_headers), RED_FILL)
+
+        # --- Sheet 3: My SKUs ---
+        ws3 = wb.create_sheet("Мои SKU")
+        sku_headers = ["name", "our_price_rub", "weight_g", "keywords"]
+        sku_rows = []
+        for sku in self.skus:
+            sku_rows.append({
+                "name": sku["name"],
+                "our_price_rub": sku.get("our_price_rub", 0),
+                "weight_g": sku.get("weight_g", 0),
+                "keywords": ", ".join(sku.get("keywords", [])),
+            })
+        self._write_sheet(ws3, sku_headers, sku_rows)
+
+        widths3 = [40, 12, 10, 30]
+        for i, w in enumerate(widths3, 1):
+            ws3.column_dimensions[get_column_letter(i)].width = w
+
+        # Save
+        OUTPUT_XLSX_PATH.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(str(OUTPUT_XLSX_PATH))
+        return OUTPUT_XLSX_PATH
+
+    # ------------------------------------------------------------------
+    # Summary builder
+    # ------------------------------------------------------------------
+    def _build_summary(self) -> list[dict]:
+        """Build per-SKU summary: min/avg/max comparable price."""
+        # Only include comparable products in stock
+        comparable = [
+            m for m in self.matches
+            if m.get("is_comparable") == "да" and m.get("in_stock") == "да"
+        ]
+
+        by_sku: dict[str, dict] = {}
+        for m in comparable:
+            sku = m.get("matched_sku", "")
+            price = float(m.get("comparable_price_rub", 0) or 0)
+            if not sku or price <= 0:
+                continue
+            if sku not in by_sku:
+                by_sku[sku] = {
+                    "sku_name": sku,
+                    "our_price_rub": m.get("our_price_rub", 0),
+                    "our_weight_g": m.get("sku_weight_g", 0),
+                    "prices": [],
+                }
+            by_sku[sku]["prices"].append(price)
+
+        # Also include SKUs with no competitors
+        for sku in self.skus:
+            name = sku["name"]
+            if name not in by_sku:
+                by_sku[name] = {
+                    "sku_name": name,
+                    "our_price_rub": sku.get("our_price_rub", 0),
+                    "our_weight_g": sku.get("weight_g", 0),
+                    "prices": [],
+                }
+
+        rows = []
+        for name, data in by_sku.items():
+            prices = data["prices"]
+            our = float(data["our_price_rub"] or 0)
+            min_p = min(prices) if prices else 0
+            avg_p = round(sum(prices) / len(prices), 2) if prices else 0
+            max_p = max(prices) if prices else 0
+            vs_min = round((our - min_p) / min_p * 100, 1) if min_p > 0 else 0
+
+            rows.append({
+                "sku_name": name,
+                "our_price_rub": our,
+                "our_weight_g": data["our_weight_g"],
+                "min_competitor_price": min_p,
+                "avg_competitor_price": avg_p,
+                "max_competitor_price": max_p,
+                "competitor_count": len(prices),
+                "our_vs_min_%": vs_min,
+            })
+
+        # Sort: highest competitor_count first, then by name
+        rows.sort(key=lambda r: (-r["competitor_count"], r["sku_name"]))
+        return rows
+
+    # ------------------------------------------------------------------
+    # XLSX helpers
+    # ------------------------------------------------------------------
+    def _write_sheet(self, ws, headers: list[str], rows: list[dict]) -> None:
+        """Write headers + rows to a worksheet with formatting."""
+        # Headers
+        for col_idx, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            cell.font = HEADER_FONT_WHITE
+            cell.fill = HEADER_FILL
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            cell.border = THIN_BORDER
+
+        # Data
+        for row_idx, row_data in enumerate(rows, 2):
+            for col_idx, h in enumerate(headers, 1):
+                value = row_data.get(h, "")
+                # Convert float → rounded for display
+                if isinstance(value, float):
+                    value = round(value, 2)
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(vertical="center")
+
+        # Freeze header row
+        ws.freeze_panes = "A2"
+        # Auto-filter
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(rows) + 1}"
+
+    @staticmethod
+    def _color_row(ws, row_idx: int, col_count: int, fill) -> None:
+        """Apply fill to all cells in a row."""
+        for col in range(1, col_count + 1):
+            ws.cell(row=row_idx, column=col).fill = fill
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
     def get_summary(self) -> dict:
         """Return summary counts."""
-        total = len(self.rows)
-        comparable = sum(1 for r in self.rows if r.get("is_comparable") == "да")
-        non_comparable = sum(1 for r in self.rows if r.get("is_comparable") == "нет")
-        new = sum(1 for r in self.rows if r.get("is_comparable", "") == "")
-        in_stock = sum(1 for r in self.rows if r.get("in_stock") == "да")
-
-        comparable_in_stock = [
-            r for r in self.rows
-            if r.get("is_comparable") == "да" and r.get("in_stock") == "да"
-        ]
-
-        prices = [float(r["comparable_price_rub"]) for r in comparable_in_stock
-                  if r.get("comparable_price_rub")]
-
+        comparable = [m for m in self.matches if m.get("is_comparable") == "да"]
         return {
-            "total": total,
-            "comparable": comparable,
-            "non_comparable": non_comparable,
-            "new_unevaluated": new,
-            "in_stock": in_stock,
-            "comparable_in_stock": len(comparable_in_stock),
-            "min_price": min(prices) if prices else 0,
-            "max_price": max(prices) if prices else 0,
-            "avg_price": round(sum(prices) / len(prices), 2) if prices else 0,
+            "total_matches": len(self.matches),
+            "comparable": len(comparable),
+            "non_comparable": sum(1 for m in self.matches if m.get("is_comparable") == "нет"),
+            "new_unevaluated": sum(1 for m in self.matches if m.get("is_comparable", "") == ""),
         }
 
 
 # ---------------------------------------------------------------------------
 # Top-level helpers for cli.py
 # ---------------------------------------------------------------------------
-def run_tracker(scraped_all: list[dict],
-                target_weight_g: float = 120.0) -> ProductTracker:
-    """Run the full 3-pass tracking pipeline.
+def run_tracker(scraped_all: list[dict], skus: list[dict]) -> ProductTracker:
+    """Run the full tracking pipeline with multi-SKU matching.
 
-    Args:
-        scraped_all: list of all RawProduct.to_dict() from all sites.
-        target_weight_g: our product weight for comparable price calculation.
-
-    Returns:
-        ProductTracker with updated data (already saved to CSV).
+    Returns ProductTracker with updated data (already saved to XLSX).
     """
-    tracker = ProductTracker(target_weight_g=target_weight_g)
+    tracker = ProductTracker(skus=skus)
 
-    # Загружаем существующую таблицу
+    # Load existing table
     existed = tracker.load()
     if existed:
-        print(f"📂 Загружено {len(tracker.rows)} продуктов из products.csv\n")
+        print(f"📂 Загружено {len(tracker.matches)} совпадений из products.xlsx\n")
     else:
-        print("📂 products.csv не найден — будет создана новая таблица\n")
+        print("📂 products.xlsx не найден — будет создан новый файл\n")
 
-    # --- Проход 1: scrape → match ---
-    print("🔄 Проход 1: сбор и сопоставление...")
-    stats1 = tracker.merge_scraped(scraped_all)
-    print(f"   Обновлено: {stats1['updated']}")
-    print(f"   Добавлено: {stats1['added']}")
-    print(f"   Пропущено (не сопоставимы): {stats1['skipped_non_comparable']}")
+    # --- Merge ---
+    print(f"🔄 Сопоставление: {len(scraped_all)} продуктов × {len(skus)} SKU...")
+    stats = tracker.merge_scraped(scraped_all)
+    print(f"   Новых совпадений: {stats['new_matches']}")
+    print(f"   Обновлено: {stats['updated']}")
+    print(f"   Пропущено (не сопоставимы): {stats['skipped']}")
 
-    # --- Проход 2: re-check missing ---
-    print("🔄 Проход 2: проверка отсутствующих...")
-    stats2 = tracker.recheck_missing()
-    print(f"   Перепроверено URL: {stats2['rechecked']}")
-    print(f"   Всё ещё доступны: {stats2['still_available']}")
-    print(f"   Больше не в наличии: {stats2['now_unavailable']}")
-
-    # --- Проход 3: save ---
-    tracker.save()
-    print(f"\n✅ Сохранено: {len(tracker.rows)} продуктов в data/products.csv")
+    # --- Save ---
+    path = tracker.save()
+    print(f"\n✅ Сохранено: {len(tracker.matches)} совпадений в {path}")
 
     return tracker
 
 
-def print_tracker_report(tracker: ProductTracker,
-                         our_price: Optional[float] = None) -> None:
-    """Print a formatted report from the tracker state."""
-    summary = tracker.get_summary()
-    comparable = tracker.get_comparable_products()
-    new_products = tracker.get_new_products()
+def print_tracker_report(tracker: ProductTracker) -> None:
+    """Print a summary report from the tracker."""
+    s = tracker.get_summary()
+    comparable_by_sku = {}
 
-    print(f"\n{'='*70}")
+    for m in tracker.matches:
+        if m.get("is_comparable") == "да" and m.get("in_stock") == "да":
+            sku = m.get("matched_sku", "")
+            price = float(m.get("comparable_price_rub", 0) or 0)
+            if sku not in comparable_by_sku:
+                comparable_by_sku[sku] = []
+            comparable_by_sku[sku].append(price)
+
+    print(f"\n{'='*60}")
     print(f"📊 ОТЧЁТ — {tracker.today}")
-    print(f"{'='*70}")
+    print(f"{'='*60}")
+    print(f"\n📋 Всего совпадений: {s['total_matches']}")
+    print(f"   Сопоставимых (да): {s['comparable']}")
+    print(f"   Несопоставимых (нет): {s['non_comparable']}")
+    print(f"   Новых (не оценено): {s['new_unevaluated']}")
 
-    print(f"\n📋 Всего продуктов в таблице: {summary['total']}")
-    print(f"   Сопоставимых (да): {summary['comparable']}")
-    print(f"   Несопоставимых (нет): {summary['non_comparable']}")
-    print(f"   Новых (не оценено): {summary['new_unevaluated']}")
-    print(f"   В наличии: {summary['in_stock']}")
+    if comparable_by_sku:
+        print(f"\n📈 Сводка по SKU (только сопоставимые в наличии):\n")
+        print(f"{'SKU':<30} {'Наша':>8} {'Мин':>8} {'Сред':>8} {'Макс':>8} {'Кол-во':>7} {'vs мин':>7}")
+        print(f"{'-'*30} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*7} {'-'*7}")
 
-    # --- Таблица сопоставимых ---
-    if comparable:
-        our_w = tracker.target_weight_g
-        header_price = f"За {our_w:.0f}г"
-        print(f"\n┌{'─'*18}┬{'─'*32}┬{'─'*8}┬{'─'*10}┬{'─'*14}┐")
-        print(f"│ {'Сайт':<16} │ {'Продукт':<30} │ {'Вес':>6} │ {'Цена':>8} │ {header_price:>12} │")
-        print(f"├{'─'*18}┼{'─'*32}┼{'─'*8}┼{'─'*10}┼{'─'*14}┤")
+        for sku_name, prices in sorted(comparable_by_sku.items()):
+            if not prices:
+                continue
+            our = 0
+            for sku in tracker.skus:
+                if sku["name"] == sku_name:
+                    our = sku.get("our_price_rub", 0)
+                    break
+            mn = min(prices)
+            avg = sum(prices) / len(prices)
+            mx = max(prices)
+            vs = f"{(our - mn) / mn * 100:+.0f}%" if mn > 0 else "—"
+            print(f"{sku_name[:30]:<30} {our:>8,.0f} {mn:>8,.0f} {avg:>8,.0f} {mx:>8,.0f} {len(prices):>7} {vs:>7}".replace(",", " "))
 
-        for r in comparable[:30]:
-            site = r['site'][:16]
-            name = r['product_name'][:30]
-            w = r.get('weight_g', '?')
-            price = f"{float(r.get('original_price_rub', 0)):,.0f}".replace(',', ' ')
-            comp = f"{float(r.get('comparable_price_rub', 0)):,.0f}".replace(',', ' ')
-            print(f"│ {site:<16} │ {name:<30} │ {w:>6} │ {price:>8} │ {comp:>12} │")
-
-        print(f"└{'─'*18}┴{'─'*32}┴{'─'*8}┴{'─'*10}┴{'─'*14}┘")
-
-        # Статистика по сопоставимым
-        print(f"\n📈 Статистика (цена за {our_w:.0f} г, только сопоставимые в наличии):")
-        print(f"   Минимум:  {summary['min_price']:,.0f} ₽".replace(',', ' '))
-        print(f"   Средняя:  {summary['avg_price']:,.0f} ₽".replace(',', ' '))
-        print(f"   Максимум: {summary['max_price']:,.0f} ₽".replace(',', ' '))
-
-        if our_price:
-            our_comparable = our_price  # already for our weight
-            vs_avg = ((our_comparable - summary['avg_price']) / summary['avg_price'] * 100) \
-                     if summary['avg_price'] > 0 else 0
-            direction = "выше" if vs_avg > 0 else "ниже"
-            print(f"\n💡 Наша цена: {our_price:,.0f} ₽ — на {abs(vs_avg):.0f}% {direction} рынка".replace(',', ' '))
-
-    # --- Новые продукты ---
-    if new_products:
-        print(f"\n🆕 Новые продукты (нужно оценить сопоставимость): {len(new_products)}")
-        print(f"   Открой data/products.csv и поставь 'да' или 'нет' в колонке is_comparable")
-        for r in new_products[:5]:
-            print(f"   - [{r['site']}] {r['product_name'][:50]} — {r.get('original_price_rub', '?')} ₽")
-        if len(new_products) > 5:
-            print(f"   ... и ещё {len(new_products) - 5}")
+    new_count = s.get("new_unevaluated", 0)
+    if new_count > 0:
+        print(f"\n📝 {new_count} новых совпадений ждут оценки.")
+        print(f"   Открой {OUTPUT_XLSX_PATH} → лист «Совпадения»")
+        print(f"   и поставь 'да' или 'нет' в колонке is_comparable.")

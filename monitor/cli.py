@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Competitor price monitoring v2 — CLI entry point.
+"""Competitor price monitoring v3 — CLI entry point.
+
+Multi-SKU analysis with keyword matching, XLSX output.
 
 Usage:
-    python -m monitor.cli --run          # Full scrape + update products.csv
-    python -m monitor.cli --report       # Show report from products.csv
-    python -m monitor.cli --quiet        # Scrape only, no output (for scheduler)
+    python -m monitor.cli --run          # Full scrape + match + save XLSX
+    python -m monitor.cli --status       # Quick summary
+    python -m monitor.cli --quiet        # Scrape + save, no output
 """
 
 import sys
 import argparse
 import json
-import datetime
 
-# Fix Windows encoding for emoji/unicode output
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -20,21 +20,16 @@ if sys.platform == "win32":
         pass
 
 from .config import (
-    DEFAULT_SITES,
-    DEFAULT_TARGETS,
-    USER_PRICE_FILE,
-    OUR_TARGET_WEIGHT_G,
-    ProductTarget,
-    SiteConfig,
-    load_user_price,
+    DEFAULT_SITES, DEFAULT_TARGETS, USER_PRICE_FILE,
+    OUR_TARGET_WEIGHT_G, SKUS_PATH, OUTPUT_XLSX_PATH,
+    SiteConfig, load_user_price,
 )
+from .matcher import load_skus, create_skus_template
 from .tracker import run_tracker, print_tracker_report, ProductTracker
 from .adapters.apeti import ApetiAdapter
 from .adapters.seafood_shop import SeafoodShopAdapter
 from .adapters.delikateska import DelikateskaAdapter
 
-
-# Adapter registry
 ADAPTERS = {
     "apeti.ru": ApetiAdapter,
     "seafood-shop.ru": SeafoodShopAdapter,
@@ -42,9 +37,6 @@ ADAPTERS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Collect raw products from all sites
-# ---------------------------------------------------------------------------
 def collect_all_sites(sites: list[SiteConfig], quiet: bool = False) -> list[dict]:
     """Scrape all configured sites, return list of raw product dicts."""
     all_raw: list[dict] = []
@@ -66,7 +58,6 @@ def collect_all_sites(sites: list[SiteConfig], quiet: bool = False) -> list[dict
             if not quiet:
                 print(f"   Собрано: {len(raw_products)} товаров")
 
-            # Deduplicate by product_id
             seen_ids = set()
             for p in raw_products:
                 pid = p.product_id
@@ -83,20 +74,27 @@ def collect_all_sites(sites: list[SiteConfig], quiet: bool = False) -> list[dict
     return all_raw
 
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
 def cmd_run(quiet: bool = False) -> None:
-    """Full run: scrape → tracker → report."""
-    target = DEFAULT_TARGETS[0]
+    """Full run: scrape → match → save XLSX."""
+    # ---- Load SKUs ----
+    if not SKUS_PATH.exists():
+        print("📝 Файл data/skus.csv не найден. Создаю шаблон...")
+        create_skus_template()
+        print(f"   ✅ Шаблон создан: {SKUS_PATH}")
+        print(f"   📋 Заполни его своими SKU (название, наша цена, вес)")
+        print(f"   📋 Затем запусти скрипт снова.")
+        return
 
-    # User price
-    our_price = load_user_price() or target.our_price_rub
-    target_weight = target.weight_g or OUR_TARGET_WEIGHT_G
+    skus = load_skus()
+    if not skus:
+        print("❌ data/skus.csv пуст или не содержит SKU.")
+        return
 
-    # --- Scrape ---
+    print(f"📋 Загружено {len(skus)} SKU из {SKUS_PATH}")
+
+    # ---- Scrape ----
     if not quiet:
-        print("=" * 60)
+        print(f"\n{'='*60}")
         print("СБОР ДАННЫХ")
         print("=" * 60)
 
@@ -107,105 +105,73 @@ def cmd_run(quiet: bool = False) -> None:
         return
 
     if not quiet:
-        print(f"\n📦 Всего собрано (до фильтрации): {len(scraped)} товаров")
+        print(f"\n📦 Всего собрано: {len(scraped)} товаров (до фильтрации)")
 
-    # --- Tracker ---
+    # ---- Tracker ----
     if not quiet:
-        print(f"\n{'=' * 60}")
-        print("ОБРАБОТКА")
+        print(f"\n{'='*60}")
+        print("СОПОСТАВЛЕНИЕ")
         print("=" * 60)
 
-    tracker = run_tracker(scraped, target_weight_g=target_weight)
+    tracker = run_tracker(scraped, skus)
 
-    # --- Report ---
+    # ---- Report ----
     if not quiet:
-        print(f"\n{'=' * 60}")
+        print(f"\n{'='*60}")
         print("ОТЧЁТ")
         print("=" * 60)
-        print_tracker_report(tracker, our_price=our_price)
-
-    # Summary
-    summary = tracker.get_summary()
-    new_count = summary.get("new_unevaluated", 0)
-    if new_count > 0:
-        print(f"\n📝 Открой data/products.csv и поставь 'да' или 'нет'")
-        print(f"   в колонке is_comparable для {new_count} новых продуктов.")
-
-
-def cmd_report() -> None:
-    """Show report from existing products.csv."""
-    tracker = ProductTracker(target_weight_g=OUR_TARGET_WEIGHT_G)
-
-    if not tracker.load():
-        print("❌ data/products.csv не найден.")
-        print("   Запустите: python -m monitor.cli --run")
-        return
-
-    target = DEFAULT_TARGETS[0]
-    our_price = load_user_price() or target.our_price_rub
-
-    print_tracker_report(tracker, our_price=our_price)
-
-    new_count = tracker.get_summary().get("new_unevaluated", 0)
-    if new_count > 0:
-        print(f"\n📝 {new_count} новых продуктов ждут оценки в data/products.csv")
+        print_tracker_report(tracker)
 
 
 def cmd_status() -> None:
-    """Quick status: just show summary counts."""
-    tracker = ProductTracker()
-    if not tracker.load():
-        print("Нет данных. Запустите: python -m monitor.cli --run")
+    """Quick status from existing XLSX."""
+    skus = load_skus()
+    if not skus:
+        print("❌ data/skus.csv не найден.")
+        print("   Запустите python -m monitor.cli --run для создания шаблона.")
         return
 
-    s = tracker.get_summary()
-    print(f"Всего продуктов: {s['total']}")
-    print(f"  Сопоставимых:   {s['comparable']} (в наличии: {s['comparable_in_stock']})")
-    print(f"  Несопоставимых: {s['non_comparable']}")
-    print(f"  Новых:          {s['new_unevaluated']}")
+    tracker = ProductTracker(skus=skus)
+    if not tracker.load():
+        print("❌ data/products.xlsx не найден.")
+        print("   Запустите: python -m monitor.cli --run")
+        return
 
-    if s['comparable_in_stock'] > 0:
-        print(f"\nЦены за {OUR_TARGET_WEIGHT_G:.0f} г:")
-        print(f"  Мин: {s['min_price']:,.0f} ₽".replace(',', ' '))
-        print(f"  Ср:  {s['avg_price']:,.0f} ₽".replace(',', ' '))
-        print(f"  Макс:{s['max_price']:,.0f} ₽".replace(',', ' '))
+    print_tracker_report(tracker)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Мониторинг цен конкурентов v2 — накопительная таблица продуктов",
+        description="Мониторинг цен конкурентов v3 — мульти-SKU + XLSX",
     )
     parser.add_argument("--run", action="store_true",
-                        help="Собрать цены и обновить products.csv")
-    parser.add_argument("--report", action="store_true",
-                        help="Показать отчёт из products.csv")
+                        help="Собрать цены, сопоставить с SKU, сохранить XLSX")
     parser.add_argument("--status", action="store_true",
-                        help="Краткая сводка")
+                        help="Краткая сводка из существующего XLSX")
     parser.add_argument("--quiet", action="store_true",
-                        help="Тихий режим (только запись CSV)")
-    parser.add_argument("--target-weight", type=float, default=OUR_TARGET_WEIGHT_G,
-                        help=f"Вес нашего продукта для сопоставления (по умолчанию: {OUR_TARGET_WEIGHT_G:.0f} г)")
+                        help="Тихий режим (только запись XLSX)")
+    parser.add_argument("--init-skus", action="store_true",
+                        help="Создать шаблон data/skus.csv")
 
     args = parser.parse_args()
 
-    if args.run:
+    if args.init_skus:
+        create_skus_template()
+        print(f"✅ Шаблон создан: {SKUS_PATH}")
+    elif args.run:
         cmd_run(quiet=args.quiet)
-    elif args.report:
-        cmd_report()
     elif args.status:
         cmd_status()
     else:
-        # Default: show status if data exists
-        tracker = ProductTracker()
-        if tracker.load():
+        # Default: status if data exists, else help
+        if SKUS_PATH.exists() and OUTPUT_XLSX_PATH.exists():
             cmd_status()
-            print("\nПолный отчёт: python -m monitor.cli --report")
         else:
             parser.print_help()
-            print("\n💡 Запустите: python -m monitor.cli --run")
+            print(f"\n💡 Первый запуск:")
+            print(f"   1. python -m monitor.cli --init-skus  (создать шаблон SKU)")
+            print(f"   2. Заполни data/skus.csv своими товарами")
+            print(f"   3. python -m monitor.cli --run        (запустить анализ)")
 
 
 if __name__ == "__main__":
