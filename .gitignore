@@ -1,0 +1,22 @@
+# Data (runtime — not in version control)
+data/prices.db
+data/reports/
+data/snapshots/
+data/user_price.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright (optional — installed per-machine)
+node_modules/
