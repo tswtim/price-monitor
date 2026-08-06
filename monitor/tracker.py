@@ -15,7 +15,6 @@ from openpyxl.utils import get_column_letter
 
 from .config import OUTPUT_XLSX_PATH, RESULT_ARCHIVE_DIR
 from .matcher import match_products_to_skus, extract_keywords
-from .normalize import is_red_caviar
 
 # ---------------------------------------------------------------------------
 # Styles for XLSX
@@ -77,13 +76,11 @@ class ProductTracker:
         """
         stats = {"new_matches": 0, "updated": 0, "skipped": 0}
 
-        # Filter: only red caviar
-        red_caviar = [p for p in scraped_products if is_red_caviar(p.get("name", ""))]
-        if not red_caviar:
+        # Match ALL scraped products against SKUs (no caviar-only filter)
+        if not scraped_products:
             return stats
 
-        # Match products to SKUs
-        new_matches = match_products_to_skus(red_caviar, self.skus)
+        new_matches = match_products_to_skus(scraped_products, self.skus)
 
         # Build index: url+sku → existing row
         existing_index: dict[str, int] = {}

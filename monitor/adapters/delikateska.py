@@ -116,8 +116,10 @@ class DelikateskaAdapter(BaseAdapter):
         set_limit = 48  # Max reasonable page size
 
         # Category identifier from the catalog URL
-        # /catalog/ikra → type = "ikra"
-        category = self.config.catalog_url.rstrip("/").split("/")[-1]
+        category = self.config.catalog_url.rstrip("/").split("/")[-1] if self.config.catalog_url else "ikra"
+        # Note: delikateska API requires a category — full catalog search not available.
+        # We scrape specific categories via config. Default is "ikra".
+        # For broader coverage, add more SiteConfig entries with different catalog URLs.
 
         while page < self.config.max_pages:
             variables = {
