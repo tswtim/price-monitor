@@ -12,83 +12,77 @@ from ..normalize import extract_weight_grams, safe_int_price
 class ApetiAdapter(BaseAdapter):
     """Scrape apeti.ru — auto-discovers all catalog categories."""
 
-    def fetch(self) -> list[RawProduct]:
-        client = httpx.Client(
+    def _make_client(self) -> httpx.Client:
+        return httpx.Client(
             timeout=self.timeout,
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept-Language": "ru-RU,ru;q=0.9",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
                 **self.headers,
             },
             follow_redirects=True,
         )
 
-        # Step 1: get all category URLs from main catalog
+    def fetch(self) -> list[RawProduct]:
+        client = self._make_client()
         category_urls = self._discover_categories(client)
-        # Always include the configured URL as fallback
         if self.config.catalog_url not in category_urls:
             category_urls.append(self.config.catalog_url)
-
         print(f"   Категорий для обхода: {len(category_urls)}")
 
-        # Step 2: scrape each category
         all_products = []
         seen_ids = set()
 
         for cat_url in category_urls:
-            page = 1
-            prev_ids = set()
-
-            # Detect nav_num from first page HTML
-            html = self._get_html(client, cat_url)
+            cat_client = self._make_client()
+            html = self._get_html(cat_client, cat_url)
             if not html:
                 continue
 
-            nav_num = self._detect_nav_num(html) or 1
+            nav = self._detect_nav_num(html) or 1
+            page = 1
+            page_seen = set()
 
             while True:
                 if page == 1:
-                    url = cat_url
+                    phtml = html
                 else:
-                    url = f"{cat_url}?PAGEN_{nav_num}={page}"
-                    # Try with &load=Y for AJAX pagination
-                    html = self._get_html(client, url)
-                    if not html or self._is_empty_page(html):
-                        # Try with load=Y parameter
-                        url_ajax = f"{cat_url}?PAGEN_{nav_num}={page}&load=Y"
-                        html = self._get_html(client, url_ajax)
-                        if not html:
+                    phtml = self._get_html(cat_client, f"{cat_url}?PAGEN_{nav}={page}")
+                    if not phtml or self._is_empty_page(phtml):
+                        phtml = self._get_html(cat_client, f"{cat_url}?PAGEN_{nav}={page}&load=Y")
+                        if not phtml:
                             break
 
-                if not html:
+                items = self._parse_products(phtml)
+                if not items:
                     break
 
-                page_products = self._parse_products(html)
-                if not page_products:
-                    break
-
-                # Check if products are different from previous page
-                new_count = 0
-                for p in page_products:
+                new_on_page = 0
+                for p in items:
                     pid = p.product_id
-                    if not pid or pid in seen_ids:
+                    if pid and (pid in page_seen or pid in seen_ids):
                         continue
-                    seen_ids.add(pid)
+                    if pid:
+                        page_seen.add(pid)
+                        seen_ids.add(pid)
                     all_products.append(p)
-                    new_count += 1
+                    new_on_page += 1
 
-                if new_count == 0:
-                    break  # all duplicates = reached end
-                if page > 1 and len(page_products) < 10:
-                    break  # partial page = last page
+                if new_on_page == 0 and page > 1:
+                    break
 
                 page += 1
-                self._sleep(0.3, 0.5)
+                if page > 60:
+                    break
+
+                page += 1
+                if page > 60:
+                    break
 
         return all_products
 
     def _discover_categories(self, client: httpx.Client) -> list[str]:
-        """Get all category URLs from the main catalog page."""
         html = self._get_html(client, "https://apeti.ru/catalog/")
         if not html:
             return []
@@ -101,35 +95,29 @@ class ApetiAdapter(BaseAdapter):
         urls = set()
         for a in tree.xpath('//a[contains(@href, "/catalog/")]/@href'):
             href = a.strip()
-            # Skip filters, auth links, non-category pages
             if any(x in href for x in ("?", "filter/", "login", "register", "element/")):
                 continue
-            # Only include leaf categories (not the root /catalog/)
             if href == "/catalog/":
                 continue
             full = urljoin(self.base_url, href)
             urls.add(full)
 
-            # Return all discovered category URLs
         return list(urls)
 
     def _detect_nav_num(self, html: str) -> int | None:
-        """Detect which PAGEN_X number this category uses."""
         match = re.search(r'PAGEN_(\d+)', html)
         if match:
             return int(match.group(1))
         return None
 
     def _is_empty_page(self, html: str) -> bool:
-        """Check if page has no products (404, empty grid, etc.)."""
-        if len(html) < 500:
+        if len(html) < 300:
             return True
         return "products-flex-item" not in html
 
     def _get_html(self, client: httpx.Client, url: str) -> str | None:
         try:
             resp = client.get(url)
-            resp.raise_for_status()
             return resp.text
         except Exception:
             return None
@@ -157,7 +145,7 @@ class ApetiAdapter(BaseAdapter):
             if t and len(t) > 3:
                 all_texts.append(t)
 
-        # Product description: longest meaningful text
+        # Product description
         description = ""
         article = ""
         for t in all_texts:
@@ -196,40 +184,62 @@ class ApetiAdapter(BaseAdapter):
                     weight_g = w
                     break
 
-        # Price
+        # Price — from joined price-section text (handles split nodes like "823" + "р" + "/кг")
         price_rub = 0.0
-        # Price per kg first
-        for t in all_texts:
-            match = re.search(r"(\d[\d\s]*)\s*р/кг", t)
-            if match and weight_g and weight_g > 0:
-                ppk = float(match.group(1).replace(" ", ""))
+
+        price_section_texts = []
+        for el in item.xpath('.//*[contains(@class, "price")]//text()'):
+            t = el.strip()
+            if t:
+                price_section_texts.append(t)
+        price_joined = " ".join(price_section_texts)
+
+        # Price per kg
+        ppk_match = re.search(r"(\d[\d\s]*)\s*(?:р|руб)\s*/\s*(?:кг|kg)", price_joined, re.IGNORECASE)
+        if not ppk_match:
+            ppk_match = re.search(r"(\d[\d\s]*)\s*(?:р|руб)\s*/\s*(?:кг|kg)", " ".join(all_texts), re.IGNORECASE)
+
+        if ppk_match:
+            ppk = float(ppk_match.group(1).replace(" ", ""))
+            if weight_g and weight_g > 0:
                 price_rub = round(ppk * weight_g / 1000, 2)
-                break
-        # Total price from text
+
+        # Total price from price section
+        if price_rub == 0.0:
+            total_match = re.search(r"(\d[\d\s]*)\s*(?:р|руб)\b", price_joined, re.IGNORECASE)
+            if total_match:
+                p = safe_int_price(total_match.group(1))
+                if p and 20 < p < 500000:
+                    price_rub = float(p)
+
+        # Total price from all text
         if price_rub == 0.0:
             for t in all_texts:
                 if re.search(r'\d+\s*(?:г|гр|грамм|кг)\b', t, re.IGNORECASE):
                     continue
-                if 'р/кг' in t:
+                if 'р/кг' in t or '/кг' in t:
                     continue
                 p = safe_int_price(t)
                 if p and 20 < p < 500000:
                     price_rub = float(p)
                     break
+
         if price_rub <= 0:
             return None
 
-        # ID, URL, Brand
+        # Product ID
         product_id = ""
         pid_el = item.xpath('.//a[@data-product-id]')
         if pid_el:
             product_id = pid_el[0].get("data-product-id", "")
 
+        # URL
         url = ""
         link_el = item.xpath('.//a[contains(@class, "name")]/@href')
         if link_el:
             url = urljoin(self.base_url, link_el[0])
 
+        # Brand
         brand = ""
         buy_el = item.xpath('.//a[contains(@class, "add2cart")]/@onclick')
         if buy_el:
