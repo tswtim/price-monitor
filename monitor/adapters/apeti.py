@@ -37,9 +37,29 @@ class ApetiAdapter(BaseAdapter):
 
         for cat_url in category_urls:
             page = 1
-            while page <= self.config.max_pages:
-                url = cat_url if page == 1 else f"{cat_url}?PAGEN_1={page}"
-                html = self._get_html(client, url)
+            prev_ids = set()
+
+            # Detect nav_num from first page HTML
+            html = self._get_html(client, cat_url)
+            if not html:
+                continue
+
+            nav_num = self._detect_nav_num(html) or 1
+
+            while True:
+                if page == 1:
+                    url = cat_url
+                else:
+                    url = f"{cat_url}?PAGEN_{nav_num}={page}"
+                    # Try with &load=Y for AJAX pagination
+                    html = self._get_html(client, url)
+                    if not html or self._is_empty_page(html):
+                        # Try with load=Y parameter
+                        url_ajax = f"{cat_url}?PAGEN_{nav_num}={page}&load=Y"
+                        html = self._get_html(client, url_ajax)
+                        if not html:
+                            break
+
                 if not html:
                     break
 
@@ -47,13 +67,20 @@ class ApetiAdapter(BaseAdapter):
                 if not page_products:
                     break
 
+                # Check if products are different from previous page
+                new_count = 0
                 for p in page_products:
                     pid = p.product_id
-                    if pid and pid in seen_ids:
+                    if not pid or pid in seen_ids:
                         continue
-                    if pid:
-                        seen_ids.add(pid)
+                    seen_ids.add(pid)
                     all_products.append(p)
+                    new_count += 1
+
+                if new_count == 0:
+                    break  # all duplicates = reached end
+                if page > 1 and len(page_products) < 10:
+                    break  # partial page = last page
 
                 page += 1
                 self._sleep(0.3, 0.5)
@@ -83,8 +110,21 @@ class ApetiAdapter(BaseAdapter):
             full = urljoin(self.base_url, href)
             urls.add(full)
 
-        # Limit to avoid excessive scraping
-        return list(urls)[:30]  # Max 30 categories
+            # Return all discovered category URLs
+        return list(urls)
+
+    def _detect_nav_num(self, html: str) -> int | None:
+        """Detect which PAGEN_X number this category uses."""
+        match = re.search(r'PAGEN_(\d+)', html)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _is_empty_page(self, html: str) -> bool:
+        """Check if page has no products (404, empty grid, etc.)."""
+        if len(html) < 500:
+            return True
+        return "products-flex-item" not in html
 
     def _get_html(self, client: httpx.Client, url: str) -> str | None:
         try:

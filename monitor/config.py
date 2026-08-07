@@ -57,7 +57,7 @@ DEFAULT_SITES: list[SiteConfig] = [
         method="html_lxml",
         catalog_url="https://apeti.ru/catalog/ikra/",
         timeout_seconds=30,
-        max_pages=5,
+        max_pages=50,
     ),
     SiteConfig(
         name="seafood-shop.ru",
@@ -72,7 +72,7 @@ DEFAULT_SITES: list[SiteConfig] = [
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         },
         timeout_seconds=30,
-        max_pages=10,
+        max_pages=50,
     ),
     SiteConfig(
         name="delikateska.ru",
