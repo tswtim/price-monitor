@@ -1,21 +1,15 @@
-"""delikateska.ru adapter — Playwright-based, full catalog.
-
-delikateska.ru blocks non-browser GraphQL requests (403).
-We use Playwright to navigate each category page and capture API responses.
-"""
+"""delikateska.ru adapter — Playwright with GraphQL capture."""
 
 import re
-import httpx
 from .base import BaseAdapter, RawProduct
 from ..normalize import extract_weight_grams
 
 
 class DelikateskaAdapter(BaseAdapter):
-    """Fetch ALL products from delikateska.ru via Playwright.
+    """Full catalog via Playwright — captures GraphQL responses.
 
-    Strategy:
-    1. Visit catalog page, capture category menu from GraphQL response
-    2. For each category, navigate to its page, capture getProducts response
+    Visits main page for shop category list (27 categories),
+    then visits each category page and captures getProducts responses.
     """
 
     def fetch(self) -> list[RawProduct]:
@@ -33,21 +27,22 @@ class DelikateskaAdapter(BaseAdapter):
             page = browser.new_page()
             page.set_viewport_size({"width": 1280, "height": 800})
 
-            # Step 1: Get category list from main catalog
-            categories = self._capture_categories(page)
-            print(f"   Категорий для обхода: {len(categories)}")
+            # Step 1: Visit main page, capture shop category menu (2nd getMobileMenuTree)
+            shop_categories = self._get_shop_categories(page)
+            if not shop_categories:
+                print("   [!] Shop categories not found, falling back to catalog page")
+                shop_categories = self._get_categories_from_catalog(page)
 
-            # Step 2: Visit each category page
-            for i, (ident, title) in enumerate(categories):
-                if i > 0:
-                    page.wait_for_timeout(500)  # brief pause between categories
+            print(f"   Категорий для обхода: {len(shop_categories)}")
+
+            # Step 2: Visit each category, capture getProducts
+            for i, (ident, title) in enumerate(shop_categories):
                 try:
-                    api_products = self._capture_category_products(page, ident)
-                except Exception as e:
-                    print(f"   [!] {title}: {e}")
-                    api_products = []
-                new_count = 0
-                for item in api_products:
+                    cat_products = self._get_category_products(page, ident)
+                except Exception:
+                    cat_products = []
+
+                for item in cat_products:
                     pid = str(item.get("id", ""))
                     if pid and pid in seen_ids:
                         continue
@@ -57,59 +52,90 @@ class DelikateskaAdapter(BaseAdapter):
                     product = self._parse_item(item)
                     if product:
                         all_products.append(product)
-                        new_count += 1
+
+                page.wait_for_timeout(300)
 
             browser.close()
 
         return all_products
 
-    def _capture_categories(self, page) -> list[tuple[str, str]]:
-        """Visit catalog page and capture category menu."""
-        api_data = []
+    def _get_shop_categories(self, page) -> list[tuple[str, str]]:
+        """Visit main page, capture the 2nd getMobileMenuTree (shop, not restaurant)."""
+        menu_trees = []
 
         def handle(response):
             if response.status == 200 and "graphql" in response.url:
                 try:
                     data = response.json()
-                    menu = data.get("data", {}).get("getMobileMenuTree", [])
-                    if menu and len(menu) > 10:
-                        api_data.append(menu)
+                    tree = data.get("data", {}).get("getMobileMenuTree", [])
+                    if tree:
+                        menu_trees.append(tree)
                 except Exception:
                     pass
 
         page.on("response", handle)
-        page.goto("https://www.delikateska.ru/catalog", timeout=45000,
+        page.goto("https://www.delikateska.ru/", timeout=45000,
                   wait_until="networkidle")
         page.wait_for_timeout(3000)
 
-        if not api_data:
-            return []
+        # The 2nd getMobileMenuTree has shop categories (27 items, not 16)
+        for tree in menu_trees:
+            if len(tree) > 20:  # Shop menu has 27, restaurant has 16
+                cats = []
+                for c in tree:
+                    if isinstance(c, dict):
+                        ident = c.get("identify", "") or ""
+                        title = c.get("title", "") or ""
+                        if ident:
+                            cats.append((ident, title))
+                if cats:
+                    return cats
 
-        menu = api_data[-1]
-        if not isinstance(menu, list):
-            return []
-        result = []
-        for c in menu:
-            if not isinstance(c, dict):
-                continue
-            ident = c.get("identify", "") or ""
-            title = c.get("title", "") or ""
-            if ident:
-                result.append((ident, title))
-        return result
+        return []
 
-    def _capture_category_products(self, page, ident: str) -> list[dict]:
-        """Navigate to a category page and capture product API response."""
-        api_items = []
+    def _get_categories_from_catalog(self, page) -> list[tuple[str, str]]:
+        """Fallback: get categories from rubricMenuTree on catalog page."""
+        menu_data = []
 
         def handle(response):
             if response.status == 200 and "graphql" in response.url:
                 try:
                     data = response.json()
-                    products = data.get("data", {}).get("getProducts", {})
-                    items = products.get("catalogItems", [])
+                    prods = data.get("data", {}).get("getProducts", {})
+                    tree = prods.get("rubricMenuTree", [])
+                    if tree:
+                        menu_data.append(tree)
+                except Exception:
+                    pass
+
+        page.on("response", handle)
+        page.goto("https://www.delikateska.ru/catalog/ikra", timeout=45000,
+                  wait_until="networkidle")
+        page.wait_for_timeout(3000)
+
+        if menu_data:
+            return [(c.get("identify", ""), c.get("title", ""))
+                    for c in menu_data[0]
+                    if isinstance(c, dict) and c.get("identify")]
+
+        return []
+
+    def _get_category_products(self, page, ident: str) -> list[dict]:
+        """Navigate to category page, scroll to load all products via infinite scroll."""
+        api_items = []
+        total_count = [0]
+
+        def handle(response):
+            if response.status == 200 and "graphql" in response.url:
+                try:
+                    data = response.json()
+                    prods = data.get("data", {}).get("getProducts", {})
+                    items = prods.get("catalogItems", [])
                     if items:
                         api_items.extend(items)
+                        tc = prods.get("totalCount", 0)
+                        if tc > total_count[0]:
+                            total_count[0] = tc
                 except Exception:
                     pass
 
@@ -118,6 +144,14 @@ class DelikateskaAdapter(BaseAdapter):
                   timeout=30000, wait_until="networkidle")
         page.wait_for_timeout(2000)
 
+        # Scroll to trigger lazy loading of more products
+        if total_count[0] > len(api_items):
+            for _ in range(30):  # up to 30 scrolls
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(500)
+                if len(api_items) >= total_count[0]:
+                    break
+
         return api_items
 
     def _parse_item(self, item: dict) -> RawProduct | None:
@@ -125,13 +159,11 @@ class DelikateskaAdapter(BaseAdapter):
         if not title:
             return None
 
-        # Price
         price_rub = float(item.get("currentPriceField", 0) or
                          item.get("price_retail", 0))
         if price_rub <= 0:
             return None
 
-        # Weight
         weight_g = None
         symbol_price = item.get("symbolPriceField", "")
         if symbol_price:
@@ -143,13 +175,13 @@ class DelikateskaAdapter(BaseAdapter):
         if weight_g is None:
             weight_g = extract_weight_grams(title)
 
-        # ID and URL
         product_id = str(item.get("id", ""))
-        rubric = item.get("mainRootRubric", {})
+        rubric = item.get("mainRootRubric", {}) or {}
         rubric_ident = rubric.get("identify", "")
-        url = f"https://www.delikateska.ru/catalog/{rubric_ident}/element/{product_id}/" if rubric_ident and product_id else ""
+        url = ""
+        if rubric_ident and product_id:
+            url = f"https://www.delikateska.ru/catalog/{rubric_ident}/element/{product_id}/"
 
-        # Stock
         gds_count = item.get("gds_count", 0)
         in_stock = gds_count > 0
 
@@ -161,8 +193,5 @@ class DelikateskaAdapter(BaseAdapter):
             price_rub=price_rub,
             in_stock=in_stock,
             url=url,
-            raw={
-                "subtitle": item.get("subtitle", ""),
-                "symbolPriceField": symbol_price,
-            },
+            raw={"symbolPriceField": symbol_price},
         )
