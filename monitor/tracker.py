@@ -89,8 +89,16 @@ class ProductTracker:
             if m.get("url"):
                 existing_index[key] = i
 
+        # Track keys seen in THIS batch to avoid duplicates within one run
+        seen_this_batch: set[str] = set()
+
         for nm in new_matches:
             key = f"{nm.get('url', '')}|{nm.get('matched_sku', '')}"
+            # Skip if already processed in this batch (duplicate from multi-category)
+            if key in seen_this_batch:
+                continue
+            seen_this_batch.add(key)
+
             if key in existing_index:
                 # Update existing
                 idx = existing_index[key]
