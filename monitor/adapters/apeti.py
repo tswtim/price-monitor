@@ -95,9 +95,9 @@ class ApetiAdapter(BaseAdapter):
         urls = set()
         for a in tree.xpath('//a[contains(@href, "/catalog/")]/@href'):
             href = a.strip()
-            if any(x in href for x in ("?", "filter/", "login", "register", "element/")):
-                continue
             if href == "/catalog/":
+                continue
+            if any(x in href for x in ("?", "filter/", "login", "register", "element/")):
                 continue
             full = urljoin(self.base_url, href)
             urls.add(full)

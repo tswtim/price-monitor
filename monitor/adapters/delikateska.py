@@ -92,9 +92,12 @@ class DelikateskaAdapter(BaseAdapter):
 
         for tree in menu_trees:
             if len(tree) > 20:  # Shop menu: 27 items
-                return [(c.get("identify", ""), c.get("title", ""))
+                cats = [(c.get("identify", ""), c.get("title", ""))
                         for c in tree
                         if isinstance(c, dict) and c.get("identify")]
+                # Add any missing categories
+                cats.append(("ot-shefa", "От шефа"))
+                return cats
 
         return []
 

@@ -24,16 +24,19 @@ class SeafoodShopAdapter(BaseAdapter):
         data = client.get(f"{self.API_BASE}/catalog/").json()
         side = data.get("content", {}).get("sideCatalog", [])
 
-        # Collect leaf categories
+        # Collect categories: if parent has URL ("Все товары категории"), skip children
         cat_urls = []
         def walk(cats):
             for cat in cats:
                 curl = cat.get("url", "")
                 children = cat.get("items", [])
-                if children:
-                    walk(children)
-                elif curl:
+                if curl:
+                    # Category has its own product list — use it, skip subcategories
                     cat_urls.append(f"{self.API_BASE}{curl}")
+                elif children:
+                    # No direct URL — drill into subcategories
+                    walk(children)
+                # else: leaf without URL — skip
         walk(side)
 
         print(f"   Категорий для обхода: {len(cat_urls)}")
