@@ -29,11 +29,13 @@ from .tracker import run_tracker, print_tracker_report, ProductTracker
 from .adapters.apeti import ApetiAdapter
 from .adapters.seafood_shop import SeafoodShopAdapter
 from .adapters.delikateska import DelikateskaAdapter
+from .adapters.globus import GlobusAdapter
 
 ADAPTERS = {
     "apeti.ru": ApetiAdapter,
     "seafood-shop.ru": SeafoodShopAdapter,
     "delikateska.ru": DelikateskaAdapter,
+    "globus.ru": GlobusAdapter,
 }
 
 

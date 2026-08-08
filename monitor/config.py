@@ -75,6 +75,15 @@ DEFAULT_SITES: list[SiteConfig] = [
         max_pages=50,
     ),
     SiteConfig(
+        name="globus.ru",
+        display_name="Глобус",
+        base_url="https://online.globus.ru",
+        method="playwright",
+        catalog_url="https://online.globus.ru/",
+        timeout_seconds=60,
+        max_pages=1,
+    ),
+    SiteConfig(
         name="delikateska.ru",
         display_name="Деликатеска",
         base_url="https://www.delikateska.ru",
