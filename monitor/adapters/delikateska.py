@@ -23,31 +23,39 @@ class DelikateskaAdapter(BaseAdapter):
         seen_ids = set()
 
         with sync_playwright() as pw:
-            # Headless with anti-detection for Colab/VPS compatibility
+            # Launch browser — prefer headed (headless=False) to avoid 403 blocks.
+            # On headless systems (Colab/VPS), use Xvfb virtual display.
+            # If neither works, fall back to headless with anti-detection.
+            launch_args = ["--no-sandbox", "--disable-setuid-sandbox",
+                          "--disable-dev-shm-usage"]
+
+            # Try headed first (needs DISPLAY or Xvfb)
             try:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox",
-                          "--disable-dev-shm-usage",
-                          "--disable-blink-features=AutomationControlled"]
-                )
-            except Exception as e:
-                print(f"   [!] Chromium error: {e}")
-                return []
+                browser = pw.chromium.launch(headless=False, args=launch_args)
+            except Exception:
+                # Fall back to headless
+                try:
+                    browser = pw.chromium.launch(headless=True, args=launch_args)
+                except Exception as e:
+                    print(f"   [!] Chromium error: {e}")
+                    return []
 
             page = browser.new_page()
             page.set_viewport_size({"width": 1280, "height": 800})
-            # Hide automation
             page.evaluate("() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); }")
 
-            # Get cookies by visiting main page
+            # Visit main page
             page.goto("https://www.delikateska.ru/", timeout=45000,
                       wait_until="networkidle")
             page.wait_for_timeout(2000)
 
-            # Check if blocked
-            if page.content()[:200].find("403") > 0:
-                print("   [!] delikateska.ru заблокировал запрос (403). Пропускаем.")
+            # Check if blocked (403)
+            body_start = page.content()[:500]
+            if "403" in body_start and "Forbidden" in body_start:
+                print("   [!] delikateska.ru заблокировал (403). Попробуй запустить с Xvfb:")
+                print("       apt-get install -y xvfb && Xvfb :99 -screen 0 1280x1024x24 &")
+                print("       export DISPLAY=:99")
+                print("   Пока пропускаем этот сайт.")
                 browser.close()
                 return []
 
