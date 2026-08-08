@@ -118,10 +118,130 @@ class ProductTracker:
         return stats
 
     # ------------------------------------------------------------------
-    # Проход 2: re-check missing (упрощённый — без HTTP-запросов)
+    # Проход 2: re-check unmatched URLs (including manually added ones)
     # ------------------------------------------------------------------
+    def recheck_unmatched(self) -> dict:
+        """Visit URLs of comparable products not found in current scrape.
+
+        This handles:
+        - Products the scraper missed
+        - Products the user added manually to result.xlsx
+        - Products that may have been removed from the site
+
+        For each unmatched row, visit the URL and try to extract current price.
+        """
+        import httpx
+        import re
+        from lxml import etree
+
+        stats = {"checked": 0, "updated": 0, "unavailable": 0, "errors": 0}
+
+        client = httpx.Client(
+            timeout=15.0,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            follow_redirects=True,
+        )
+
+        for row in self.matches:
+            # Only check comparable products not found in current scrape
+            if row.get("is_comparable", "") != "да":
+                continue
+            if row.get("check_status") == "да":
+                continue  # already updated in merge_scraped
+
+            url = (row.get("url") or "").strip()
+            if not url:
+                row["check_status"] = "нет"
+                continue
+
+            stats["checked"] += 1
+
+            try:
+                resp = client.get(url)
+                html = resp.text
+
+                if resp.status_code >= 400 or len(html) < 500:
+                    row["in_stock"] = "нет"
+                    row["check_status"] = "да"
+                    row["last_checked"] = self.today
+                    stats["unavailable"] += 1
+                    continue
+
+                # Try to extract price
+                price = self._extract_price_from_html(html, row.get("site", ""))
+                if price and price > 0:
+                    weight_g = float(row.get("product_weight_g", 0) or 0)
+                    sku_weight = float(row.get("sku_weight_g", 0) or 0)
+                    row["product_price_rub"] = str(price)
+                    if weight_g > 0 and sku_weight > 0:
+                        comparable = round(price / weight_g * sku_weight, 2)
+                        row["comparable_price_rub"] = str(comparable)
+                    row["in_stock"] = "да"
+                    row["check_status"] = "да"
+                    row["last_checked"] = self.today
+                    stats["updated"] += 1
+                else:
+                    row["in_stock"] = "нет"
+                    row["check_status"] = "да"
+                    row["last_checked"] = self.today
+                    stats["unavailable"] += 1
+
+            except Exception:
+                row["check_status"] = "нет"
+                stats["errors"] += 1
+
+        return stats
+
+    @staticmethod
+    def _extract_price_from_html(html: str, site: str) -> float | None:
+        """Try to extract a price from a product page HTML."""
+        import re
+        from lxml import etree
+
+        # Method 1: Look for price patterns in text
+        # "1 485 ₽", "1485 руб", "1 485 р."
+        prices = re.findall(r'(\d[\d\s]{1,8})\s*(?:₽|руб|р\.)', html)
+        for p_str in prices:
+            try:
+                p = int(p_str.replace(" ", ""))
+                if 20 < p < 500000:
+                    return float(p)
+            except ValueError:
+                continue
+
+        # Method 2: apeti.ru — product-price-block
+        if "apeti" in site:
+            try:
+                tree = etree.HTML(html)
+                for el in tree.xpath('//*[contains(@class, "product-price-block")]//text()'):
+                    p = re.search(r'(\d[\d\s]*)', el.strip())
+                    if p:
+                        try:
+                            return float(p.group(1).replace(" ", ""))
+                        except ValueError:
+                            continue
+            except Exception:
+                pass
+
+        # Method 3: seafood-shop — embedded JSON
+        if "seafood-shop" in site:
+            import json as _json
+            for match in re.finditer(r'"priceSource":(\d+)', html):
+                return float(match.group(1))
+            # Try next.js data
+            for match in re.finditer(r'"price":(\d+)', html):
+                val = float(match.group(1))
+                if 20 < val < 500000:
+                    return val
+
+        return None
+
     def finalize(self) -> None:
-        """Mark products not found in current scrape as unchecked."""
+        """Mark remaining unchecked products."""
         for m in self.matches:
             if m.get("is_comparable") == "да" and m.get("check_status") != "да":
                 m["check_status"] = "нет"
@@ -343,11 +463,21 @@ def run_tracker(scraped_all: list[dict], skus: list[dict]) -> ProductTracker:
         print("📂 result.xlsx не найден — будет создан новый файл\n")
 
     # --- Merge ---
-    print(f"🔄 Сопоставление: {len(scraped_all)} продуктов × {len(skus)} SKU...")
+    print(f"🔄 Проход 1: сопоставление {len(scraped_all)} продуктов × {len(skus)} SKU...")
     stats = tracker.merge_scraped(scraped_all)
-    print(f"   Новых совпадений: {stats['new_matches']}")
     print(f"   Обновлено: {stats['updated']}")
+    print(f"   Новых совпадений: {stats['new_matches']}")
     print(f"   Пропущено (не сопоставимы): {stats['skipped']}")
+
+    # --- Re-check unmatched (manually added URLs + missed products) ---
+    print(f"🔄 Проход 2: проверка ссылок, не найденных в текущем сборе...")
+    recheck_stats = tracker.recheck_unmatched()
+    if recheck_stats['checked'] > 0:
+        print(f"   Проверено URL: {recheck_stats['checked']}")
+        print(f"   Обновлено (доступны): {recheck_stats['updated']}")
+        print(f"   Недоступны: {recheck_stats['unavailable']}")
+        if recheck_stats['errors'] > 0:
+            print(f"   Ошибок: {recheck_stats['errors']}")
 
     # --- Save ---
     path = tracker.save()
