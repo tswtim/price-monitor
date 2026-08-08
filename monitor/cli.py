@@ -30,12 +30,20 @@ from .adapters.apeti import ApetiAdapter
 from .adapters.seafood_shop import SeafoodShopAdapter
 from .adapters.delikateska import DelikateskaAdapter
 from .adapters.globus import GlobusAdapter
+from .adapters.lavka import LavkaAdapter
+from .adapters.samokat import SamokatAdapter
+from .adapters.ozon import OzonAdapter
+from .adapters.perekrestok import PerekrestokAdapter
 
 ADAPTERS = {
     "apeti.ru": ApetiAdapter,
     "seafood-shop.ru": SeafoodShopAdapter,
     "delikateska.ru": DelikateskaAdapter,
     "globus.ru": GlobusAdapter,
+    "lavka.yandex.ru": LavkaAdapter,
+    "samokat.ru": SamokatAdapter,
+    "ozon.ru": OzonAdapter,
+    "perekrestok.ru": PerekrestokAdapter,
 }
 
 
