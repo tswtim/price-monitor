@@ -239,13 +239,17 @@ class ApetiAdapter(BaseAdapter):
         if link_el:
             url = urljoin(self.base_url, link_el[0])
 
-        # Brand
+        # Brand + stock status
         brand = ""
+        in_stock = True
         buy_el = item.xpath('.//a[contains(@class, "add2cart")]/@onclick')
         if buy_el:
             parts = buy_el[0].split(",")
             if len(parts) >= 4:
                 brand = parts[3].strip().strip("'\" ")
+        else:
+            # No "buy" button = likely out of stock
+            in_stock = False
 
         return RawProduct(
             site=self.name,
@@ -254,6 +258,7 @@ class ApetiAdapter(BaseAdapter):
             brand=brand,
             weight_g=weight_g,
             price_rub=price_rub,
+            in_stock=in_stock,
             url=url,
             raw={"article": article, "all_texts": all_texts},
         )

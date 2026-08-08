@@ -114,8 +114,9 @@ class SeafoodShopAdapter(BaseAdapter):
             link = f"https://seafood-shop.ru{link}"
 
         product_id = item.get("article") or item.get("code") or str(item.get("id", ""))
+        # "Нет" = out of stock, everything else ("Мало", "Достаточно", etc.) = in stock
         available = item.get("available", "")
-        in_stock = available not in ("Нет", "0", "")
+        in_stock = available != "Нет"
 
         return RawProduct(
             site=self.name,

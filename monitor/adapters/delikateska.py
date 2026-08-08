@@ -146,7 +146,7 @@ class DelikateskaAdapter(BaseAdapter):
                                     id title price_retail currentPriceField symbolPriceField
                                     measureItem { symbol }
                                     mainRootRubric { identify }
-                                    gds_count is_not_for_sale
+                                    gds_count is_not_for_sale active
                                 }
                                 totalCount
                             }
@@ -191,7 +191,8 @@ class DelikateskaAdapter(BaseAdapter):
         if not title:
             return None
 
-        if item.get("is_not_for_sale") == "Y":
+        # Skip products not for sale or inactive
+        if item.get("is_not_for_sale") == "Y" or item.get("active") == "N":
             return None
 
         price_rub = float(item.get("currentPriceField", 0) or
@@ -215,7 +216,11 @@ class DelikateskaAdapter(BaseAdapter):
         rubric_ident = rubric.get("identify", "")
         url = f"https://www.delikateska.ru/catalog/{rubric_ident}/element/{product_id}/" if rubric_ident and product_id else ""
 
-        in_stock = item.get("gds_count", 0) > 0
+        # gds_count > 0 AND not marked as not-for-sale AND active
+        gds = item.get("gds_count", 0)
+        not_for_sale = item.get("is_not_for_sale", "") == "Y"
+        is_active = item.get("active", "Y") != "N"
+        in_stock = gds > 0 and not not_for_sale and is_active
 
         return RawProduct(
             site=self.name,
