@@ -23,13 +23,33 @@ class DelikateskaAdapter(BaseAdapter):
         seen_ids = set()
 
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False)
+            # Headless with anti-detection for Colab/VPS compatibility
+            try:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox",
+                          "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled"]
+                )
+            except Exception as e:
+                print(f"   [!] Chromium error: {e}")
+                return []
+
             page = browser.new_page()
+            page.set_viewport_size({"width": 1280, "height": 800})
+            # Hide automation
+            page.evaluate("() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); }")
 
             # Get cookies by visiting main page
             page.goto("https://www.delikateska.ru/", timeout=45000,
                       wait_until="networkidle")
             page.wait_for_timeout(2000)
+
+            # Check if blocked
+            if page.content()[:200].find("403") > 0:
+                print("   [!] delikateska.ru заблокировал запрос (403). Пропускаем.")
+                browser.close()
+                return []
 
             # Get shop category list via Playwright network capture
             shop_cats = self._get_shop_categories(page)
