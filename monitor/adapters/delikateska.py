@@ -214,7 +214,7 @@ class DelikateskaAdapter(BaseAdapter):
         product_id = str(item.get("id", ""))
         rubric = item.get("mainRootRubric", {}) or {}
         rubric_ident = rubric.get("identify", "")
-        url = f"https://www.delikateska.ru/catalog/{rubric_ident}/element/{product_id}/" if rubric_ident and product_id else ""
+        url = f"https://www.delikateska.ru/product/{product_id}" if product_id else ""
 
         # gds_count > 0 AND not marked as not-for-sale AND active
         gds = item.get("gds_count", 0)

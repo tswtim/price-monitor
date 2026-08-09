@@ -70,7 +70,8 @@ class LavkaAdapter(BaseAdapter):
                             v = float(m.group(1).replace(",","."))
                             wg = v*1000 if m.group(2) in ("кг","л") else v
                     if wg is None: wg = extract_weight_grams(name)
-                    all_products.append(RawProduct(site=self.name,product_id=pid,name=name,weight_g=wg,price_rub=price_rub,in_stock=True,url=item.get("href",""),raw={}))
+                    url = item.get("href","") or f"https://lavka.yandex.ru/product/{pid}"
+                    all_products.append(RawProduct(site=self.name,product_id=pid,name=name,weight_g=wg,price_rub=price_rub,in_stock=True,url=url,raw={}))
 
                 if (i+1) % 10 == 0:
                     print(f"   {i+1}/{len(categories)}, {len(all_products)} товаров")

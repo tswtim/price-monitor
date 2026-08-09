@@ -164,7 +164,14 @@ class GlobusAdapter(BaseAdapter):
             weight_g = extract_weight_grams(name)
 
         pid = str(item.get("id", ""))
-        url = f"https://online.globus.ru/product/{pid}/" if pid else ""
+        # Use the product's own URL field, or construct from id
+        product_url = item.get("url", "") or ""
+        if product_url and not product_url.startswith("http"):
+            url = f"https://online.globus.ru{product_url}"
+        elif product_url:
+            url = product_url
+        else:
+            url = f"https://online.globus.ru/products/{pid}/" if pid else ""
         stock = item.get("state_id") == 1 and item.get("active", False)
 
         return RawProduct(
