@@ -1,4 +1,4 @@
-"""samokat.ru adapter — DOM scraping via Playwright."""
+"""samokat.ru adapter — DOM scraping via Playwright (system Chrome)."""
 import re
 from .base import BaseAdapter, RawProduct
 from ..normalize import extract_weight_grams
@@ -11,7 +11,10 @@ class SamokatAdapter(BaseAdapter):
             return []
         all_products, seen_ids = [], set()
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=False)
+            try:
+                browser = pw.chromium.launch(channel="chrome", headless=False)
+            except:
+                browser = pw.chromium.launch(headless=False)
             page = browser.new_page()
             page.goto("https://samokat.ru/", timeout=45000, wait_until="commit")
             page.wait_for_timeout(5000)

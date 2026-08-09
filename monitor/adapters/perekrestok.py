@@ -11,14 +11,12 @@ class PerekrestokAdapter(BaseAdapter):
             return []
         all_products, seen_ids = [], set()
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(
-                headless=False,
-                args=["--no-sandbox","--disable-blink-features=AutomationControlled"]
-            )
+            try:
+                browser = pw.chromium.launch(channel="chrome", headless=False)
+            except:
+                browser = pw.chromium.launch(headless=False)
             page = browser.new_page()
             page.set_viewport_size({"width": 1400, "height": 900})
-            # Hide automation
-            page.evaluate("() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); }")
 
             try:
                 page.goto("https://www.perekrestok.ru/", timeout=60000, wait_until="commit")
