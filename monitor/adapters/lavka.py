@@ -35,8 +35,11 @@ class LavkaAdapter(BaseAdapter):
 
                 # Scroll to load all products
                 for _ in range(20):
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(500)
+                    try:
+                        page.evaluate("window.scrollTo(0, document.body?.scrollHeight || 0)")
+                        page.wait_for_timeout(500)
+                    except:
+                        break
 
                 # Extract products from DOM
                 items = page.evaluate("""() => {
